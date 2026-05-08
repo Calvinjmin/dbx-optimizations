@@ -15,11 +15,13 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-dbutils.widgets.multiselect(
+# Use a text widget instead of multiselect — multiselect's comma-separated
+# defaultValue parsing varies across DBR versions and breaks with
+# DefaultValueNotInChoicesList on some runtimes. Text is portable.
+dbutils.widgets.text(
     "queries",
     "warehouse,query_table,jobs",
-    ["warehouse", "query_table", "jobs"],
-    label="Queries to run",
+    label="Queries (comma-separated subset of: warehouse, query_table, jobs)",
 )
 dbutils.widgets.dropdown(
     "mode",
@@ -119,8 +121,15 @@ print("Config loaded.")
 
 # COMMAND ----------
 
-selected = [s for s in dbutils.widgets.get("queries").split(",") if s]
+selected = [s.strip() for s in dbutils.widgets.get("queries").split(",") if s.strip()]
 mode = dbutils.widgets.get("mode")
+
+unknown = [q for q in selected if q not in QUERY_FILES]
+if unknown:
+    raise ValueError(
+        f"Unknown quer{'y' if len(unknown) == 1 else 'ies'} {unknown}. "
+        f"Valid choices: {list(QUERY_FILES)}"
+    )
 print(f"Selected: {selected} | mode: {mode}")
 
 if mode == "parallel" and len(selected) > 1:

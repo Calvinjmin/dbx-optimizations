@@ -15,13 +15,14 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-# Use a text widget instead of multiselect — multiselect's comma-separated
-# defaultValue parsing varies across DBR versions and breaks with
-# DefaultValueNotInChoicesList on some runtimes. Text is portable.
-dbutils.widgets.text(
+# multiselect's `defaultValue` must be a single choice (Databricks looks it
+# up as one literal string in `choices`). Default to one query — open the
+# widget dropdown to check the others.
+dbutils.widgets.multiselect(
     "queries",
-    "warehouse,query_table,jobs",
-    label="Queries (comma-separated subset of: warehouse, query_table, jobs)",
+    "warehouse",
+    ["warehouse", "query_table", "jobs"],
+    label="Queries to run",
 )
 dbutils.widgets.dropdown(
     "mode",

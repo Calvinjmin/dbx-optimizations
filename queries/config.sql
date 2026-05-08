@@ -2,8 +2,8 @@
 -- Run this FIRST in your session to set up the shared `waf_config` temp view
 -- and AI session variables. All three recommendation queries reference values
 -- defined here so you only edit thresholds in one place:
---   • sql_query_table_recommendations.sql
---   • sql_warehouse_recommendations.sql
+--   • query_table_recommendations.sql
+--   • warehouse_recommendations.sql
 --   • jobs_serverless_candidacy.sql
 --
 -- Both the temp view and the DECLARE'd variables are session-scoped, so re-run
@@ -25,7 +25,7 @@ SELECT
   INTERVAL 30 DAY AS lookback,            -- analysis window for all queries
 
   -- ───────────────────────────────────────────────────────────────────────────
-  -- sql_query_table_recommendations.sql
+  -- query_table_recommendations.sql
   -- ───────────────────────────────────────────────────────────────────────────
 
   -- Skip noise.
@@ -91,7 +91,7 @@ SELECT
   '^(test-|dev-|scratch-)' AS jobs_exclude_name_pattern,
 
   -- ───────────────────────────────────────────────────────────────────────────
-  -- sql_warehouse_recommendations.sql
+  -- warehouse_recommendations.sql
   -- ───────────────────────────────────────────────────────────────────────────
 
   -- Pricing — tune for your region/contract.

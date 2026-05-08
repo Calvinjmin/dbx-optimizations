@@ -47,7 +47,7 @@ print(f"Repo root: {REPO_ROOT}")
 
 # COMMAND ----------
 
-run_sql_file("waf_config.sql")
+run_sql_file("queries/config.sql")
 print("Config loaded.")
 
 # COMMAND ----------
@@ -58,9 +58,9 @@ print("Config loaded.")
 # COMMAND ----------
 
 QUERIES = [
-    "sql_warehouse_recommendations.sql",
-    "sql_query_table_recommendations.sql",
-    "jobs_serverless_candidacy.sql",
+    "queries/warehouse_recommendations.sql",
+    "queries/query_table_recommendations.sql",
+    "queries/jobs_serverless_candidacy.sql",
 ]
 
 with ThreadPoolExecutor(max_workers=len(QUERIES)) as ex:
@@ -76,12 +76,12 @@ print("All three queries finished.")
 
 # COMMAND ----------
 
-display(results["sql_warehouse_recommendations.sql"])
+display(results["queries/warehouse_recommendations.sql"])
 
 # COMMAND ----------
 
-display(results["sql_query_table_recommendations.sql"])
+display(results["queries/query_table_recommendations.sql"])
 
 # COMMAND ----------
 
-display(results["jobs_serverless_candidacy.sql"])
+display(results["queries/jobs_serverless_candidacy.sql"])

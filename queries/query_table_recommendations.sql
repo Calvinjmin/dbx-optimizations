@@ -1,7 +1,7 @@
 -- Query and Table Optimization Recommendations
 -- Reads system.query.history, system.access.table_lineage.
--- Tune thresholds in waf_config.sql (run that file FIRST in your session).
--- Pair with sql_warehouse_recommendations.sql (warehouse-level).
+-- Tune thresholds in config.sql (run that file FIRST in your session).
+-- Pair with warehouse_recommendations.sql (warehouse-level).
 
 WITH warehouse_names AS (
   SELECT warehouse_id, warehouse_name

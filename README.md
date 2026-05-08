@@ -3,14 +3,24 @@
 Databricks SQL queries for Well-Architected Framework (WAF) reviews. Reads
 system tables and surfaces optimization recommendations.
 
-## Files
+## Layout
 
-- **`waf_config.sql`** — shared thresholds. Defines the `waf_config` temp view + `enable_ai_reason` / `ai_model` session variables. Run first.
-- **`sql_warehouse_recommendations.sql`** — per-warehouse: decommission, resize, migrate to serverless, raise/cap clusters, auto-stop housekeeping. Includes projected $ delta.
-- **`sql_query_table_recommendations.sql`** — per-query/table: expensive query review, MV / liquid clustering candidates, high-spill queries, hot tables, sub-second BI engine candidates.
+```
+queries/      tunable SQL — config + three recommendation queries
+notebooks/    Python runner notebooks that load and execute the queries
+```
+
+### `queries/`
+
+- **`config.sql`** — shared thresholds. Defines the `waf_config` temp view + `enable_ai_reason` / `ai_model` session variables. Run first.
+- **`warehouse_recommendations.sql`** — per-warehouse: decommission, resize, migrate to serverless, raise/cap clusters, auto-stop housekeeping. Includes projected $ delta.
+- **`query_table_recommendations.sql`** — per-query/table: expensive query review, MV / liquid clustering candidates, high-spill queries, hot tables, sub-second BI engine candidates.
 - **`jobs_serverless_candidacy.sql`** — scores classic-compute jobs for serverless migration (0–100), with optional `ai_query()` justification per row.
-- **`notebooks/run_sequential.py`** — Python notebook that loads each `.sql` file by path and runs them in order. No SQL duplicated.
-- **`notebooks/run_parallel.py`** — same, but runs the three query files concurrently after config setup.
+
+### `notebooks/`
+
+- **`run_sequential.py`** — loads each `.sql` file by path and runs them in order. No SQL duplicated.
+- **`run_parallel.py`** — same, but runs the three query files concurrently after the config setup.
 
 ## Requirements
 
@@ -23,6 +33,6 @@ system tables and surfaces optimization recommendations.
 Connect Databricks to this repo via Git folder, then either:
 
 - Open `notebooks/run_sequential.py` (or `run_parallel.py`) and **Run all**, or
-- Run `waf_config.sql` followed by any individual query in the SQL editor (same session).
+- Run `queries/config.sql` followed by any individual query in the SQL editor (same session).
 
-Tune thresholds in `waf_config.sql`.
+Tune thresholds in `queries/config.sql`.

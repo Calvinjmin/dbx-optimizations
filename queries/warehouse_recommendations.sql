@@ -1,7 +1,7 @@
 -- SQL Warehouse Right-Sizing Recommendations
 -- Reads system.compute.warehouses, system.compute.warehouse_events,
 -- system.query.history, system.billing.usage.
--- Tune thresholds in waf_config.sql (run that file FIRST in your session).
+-- Tune thresholds in config.sql (run that file FIRST in your session).
 
 WITH current_warehouses AS (
   SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type,

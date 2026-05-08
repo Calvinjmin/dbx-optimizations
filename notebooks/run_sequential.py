@@ -46,7 +46,7 @@ print(f"Repo root: {REPO_ROOT}")
 
 # COMMAND ----------
 
-run_sql_file("waf_config.sql")
+run_sql_file("queries/config.sql")
 print("Config loaded.")
 
 # COMMAND ----------
@@ -56,7 +56,7 @@ print("Config loaded.")
 
 # COMMAND ----------
 
-display(run_sql_file("sql_warehouse_recommendations.sql"))
+display(run_sql_file("queries/warehouse_recommendations.sql"))
 
 # COMMAND ----------
 
@@ -65,7 +65,7 @@ display(run_sql_file("sql_warehouse_recommendations.sql"))
 
 # COMMAND ----------
 
-display(run_sql_file("sql_query_table_recommendations.sql"))
+display(run_sql_file("queries/query_table_recommendations.sql"))
 
 # COMMAND ----------
 
@@ -74,4 +74,4 @@ display(run_sql_file("sql_query_table_recommendations.sql"))
 
 # COMMAND ----------
 
-display(run_sql_file("jobs_serverless_candidacy.sql"))
+display(run_sql_file("queries/jobs_serverless_candidacy.sql"))

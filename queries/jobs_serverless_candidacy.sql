@@ -3,7 +3,7 @@
 -- No cost projection — just operational signals + the classic DBU spend as the
 -- size-of-opportunity indicator.
 --
--- Tune thresholds + the AI on/off toggle in waf_config.sql (run that file
+-- Tune thresholds + the AI on/off toggle in config.sql (run that file
 -- FIRST in your session). The AI column is gated by the `enable_ai_reason`
 -- session variable defined there — set to FALSE to skip ai_query() entirely.
 

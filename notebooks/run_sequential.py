@@ -10,6 +10,7 @@
 # COMMAND ----------
 
 import os
+import re
 
 _nb_path = (
     dbutils.notebook.entry_point.getDbutils()
@@ -22,18 +23,20 @@ REPO_ROOT = "/Workspace" + os.path.dirname(os.path.dirname(_nb_path))
 
 
 def run_sql_file(rel_path: str):
-    """Execute every statement in a .sql file. Returns the last DataFrame (or None)."""
+    """Execute every statement in a .sql file. Returns the last DataFrame (or None).
+
+    Strips block + line comments first so that ';' chars inside comments don't
+    split a statement mid-way (e.g. '-- contributes points; full points at...').
+    """
     with open(os.path.join(REPO_ROOT, rel_path)) as f:
         sql = f.read()
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    sql = re.sub(r"--[^\n]*", "", sql)
     last = None
     for stmt in sql.split(";"):
         stmt = stmt.strip()
-        if not stmt or all(
-            line.strip().startswith("--") or not line.strip()
-            for line in stmt.splitlines()
-        ):
-            continue
-        last = spark.sql(stmt)
+        if stmt:
+            last = spark.sql(stmt)
     return last
 
 

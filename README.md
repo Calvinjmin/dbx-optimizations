@@ -19,8 +19,7 @@ notebooks/    Python runner notebooks that load and execute the queries
 
 ### `notebooks/`
 
-- **`run_sequential.py`** — loads each `.sql` file by path and runs them in order. No SQL duplicated.
-- **`run_parallel.py`** — same, but runs the three query files concurrently after the config setup.
+- **`run.py`** — single runner. Loads each `.sql` file by path (no SQL duplicated). Two widgets: `queries` (multiselect — pick any subset of warehouse / query_table / jobs) and `mode` (`parallel` or `sequential`). Config always runs first.
 
 ## Requirements
 
@@ -32,7 +31,7 @@ notebooks/    Python runner notebooks that load and execute the queries
 
 Connect Databricks to this repo via Git folder, then either:
 
-- Open `notebooks/run_sequential.py` (or `run_parallel.py`) and **Run all**, or
+- Open `notebooks/run.py`, set the widgets, and **Run all**, or
 - Run `queries/config.sql` followed by any individual query in the SQL editor (same session).
 
 Tune thresholds in `queries/config.sql`.

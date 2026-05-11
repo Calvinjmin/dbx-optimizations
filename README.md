@@ -1,7 +1,6 @@
-# dbx-optimizations
+# Databricks Optimizations 
 
-Databricks SQL queries for Well-Architected Framework (WAF) reviews. Reads
-system tables and surfaces optimization recommendations.
+Databricks SQL queries for Well-Architected Framework (WAF) reviews. Reads system tables and surfaces optimization recommendations.
 
 ## Layout
 

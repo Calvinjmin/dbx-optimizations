@@ -1,3 +1,8 @@
+venv/
+.vscode/*
 .claude/
 .vibe-demo.yaml
 .DS_Store
+
+./databricks.yml
+databricks.yml

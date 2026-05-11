@@ -116,8 +116,14 @@ def _run_with_job_group(query_name: str, rel_path: str):
 
     Separate job groups make concurrent jobs easier to spot in the Spark UI
     and can improve fairness vs an anonymous mix of actions from one thread.
+    Serverless compute blocks `spark.sparkContext` access (JVM_ATTRIBUTE_
+    NOT_SUPPORTED) — degrade gracefully there and just run the SQL without
+    the UI grouping.
     """
-    sc = spark.sparkContext
+    try:
+        sc = spark.sparkContext
+    except Exception:
+        return _run_and_materialize(rel_path)
     sc.setJobGroup(
         f"waf_runner_{query_name}",
         f"WAF runner — {query_name}",

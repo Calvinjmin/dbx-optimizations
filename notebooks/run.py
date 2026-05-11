@@ -193,10 +193,32 @@ print(f"Finished {len(results)} quer{'y' if len(results) == 1 else 'ies'}.")
 
 # COMMAND ----------
 
+from decimal import Decimal
+
 import pandas as pd
 
+
+def _decimal_to_float(p):
+    """Spark DECIMAL columns surface as Python `Decimal` objects in pandas, and
+    `Decimal / float` (or `Decimal * float`) raises TypeError. Cast any
+    object-dtype column whose first non-null value is a Decimal to float64 so
+    downstream arithmetic Just Works."""
+    if p is None:
+        return None
+    for col in p.columns:
+        s = p[col]
+        if s.dtype == object:
+            non_null = s.dropna()
+            if not non_null.empty and isinstance(non_null.iloc[0], Decimal):
+                p[col] = pd.to_numeric(s, errors="coerce")
+    return p
+
+
 # Recommendation outputs are small (typically <1k rows each), so pandas is fine.
-pdf = {q: (df.toPandas() if df is not None else None) for q, df in results.items()}
+pdf = {
+    q: _decimal_to_float(df.toPandas()) if df is not None else None
+    for q, df in results.items()
+}
 wh = pdf.get("warehouse")
 qt = pdf.get("query_table")
 jb = pdf.get("jobs")

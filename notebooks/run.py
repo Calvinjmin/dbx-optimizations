@@ -3,8 +3,11 @@
 # MAGIC # WAF Recommendations — Runner
 # MAGIC
 # MAGIC Loads SQL files from `queries/` by path and runs them — no SQL
-# MAGIC duplicated in this notebook. Use the widgets at the top to pick which
-# MAGIC queries to run and whether to run them sequentially or in parallel.
+# MAGIC duplicated in this notebook. Pick one or more queries with the widget;
+# MAGIC **all selected queries run at once** on the cluster (materialized before
+# MAGIC results render). With multiple selections, table previews are also
+# MAGIC started together from one cell.
+# MAGIC
 # MAGIC The config (`queries/config.sql`) always runs first.
 # MAGIC
 # MAGIC **Compute:** Serverless notebook (or DBR 14.1+).
@@ -13,7 +16,7 @@
 
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
 
 # multiselect's `defaultValue` must be a single choice (Databricks looks it
 # up as one literal string in `choices`). Default to one query — open the
@@ -23,12 +26,6 @@ dbutils.widgets.multiselect(
     "warehouse",
     ["warehouse", "query_table", "jobs"],
     label="Queries to run",
-)
-dbutils.widgets.dropdown(
-    "mode",
-    "parallel",
-    ["parallel", "sequential"],
-    label="Execution mode",
 )
 
 # COMMAND ----------
@@ -104,17 +101,37 @@ def run_sql_file(rel_path: str):
 
 
 def _run_and_materialize(rel_path: str):
-    """spark.sql('SELECT ...') is lazy — the query only runs when an action
-    (display, count, collect, ...) is called. In parallel mode, downstream
-    display() calls are in separate sequential cells, so without forcing
-    execution here the 'parallelism' would only cover plan-building. Calling
-    .cache() + .count() triggers execution inside the worker thread and
-    keeps the materialized result in memory for the later display()."""
+    """`spark.sql` is lazy until an action. `.cache()` + `.count()` runs the
+    query immediately (in the worker thread when using the pool) and keeps
+    the result cached so `display()` only reads materialized data."""
     df = run_sql_file(rel_path)
     if df is not None:
         df.cache()
         df.count()
     return df
+
+
+def _run_with_job_group(query_name: str, rel_path: str):
+    """Run one SQL file with a dedicated Spark job group (per-thread).
+
+    Separate job groups make concurrent jobs easier to spot in the Spark UI
+    and can improve fairness vs an anonymous mix of actions from one thread.
+    """
+    sc = spark.sparkContext
+    sc.setJobGroup(
+        f"waf_runner_{query_name}",
+        f"WAF runner — {query_name}",
+        interruptOnCancel=False,
+    )
+    try:
+        return _run_and_materialize(rel_path)
+    finally:
+        sc.clearJobGroup()
+
+
+def _show_result(title: str, df):
+    print(f"### {title}")
+    display(df)
 
 
 print(f"Repo root: {REPO_ROOT}")
@@ -137,7 +154,6 @@ print("Config loaded.")
 # COMMAND ----------
 
 selected = [s.strip() for s in dbutils.widgets.get("queries").split(",") if s.strip()]
-mode = dbutils.widgets.get("mode")
 
 unknown = [q for q in selected if q not in QUERY_FILES]
 if unknown:
@@ -145,16 +161,17 @@ if unknown:
         f"Unknown quer{'y' if len(unknown) == 1 else 'ies'} {unknown}. "
         f"Valid choices: {list(QUERY_FILES)}"
     )
-print(f"Selected: {selected} | mode: {mode}")
+print(f"Selected: {selected}")
 
-if mode == "parallel" and len(selected) > 1:
-    with ThreadPoolExecutor(max_workers=len(selected)) as ex:
-        futures = {
-            q: ex.submit(_run_and_materialize, QUERY_FILES[q]) for q in selected
+results = {}
+if selected:
+    max_workers = min(len(selected), 16)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_query = {
+            ex.submit(_run_with_job_group, q, QUERY_FILES[q]): q for q in selected
         }
-        results = {q: f.result() for q, f in futures.items()}
-else:
-    results = {q: run_sql_file(QUERY_FILES[q]) for q in selected}
+        wait(future_to_query.keys(), return_when=ALL_COMPLETED)
+        results = {future_to_query[fut]: fut.result() for fut in future_to_query}
 
 print(f"Finished {len(results)} quer{'y' if len(results) == 1 else 'ies'}.")
 
@@ -162,23 +179,19 @@ print(f"Finished {len(results)} quer{'y' if len(results) == 1 else 'ies'}.")
 
 # MAGIC %md
 # MAGIC ## 3. Results
-# MAGIC One cell per query, so each result gets its own table viewer.
-# MAGIC Cells whose query is unselected display nothing.
+# MAGIC Selected queries only. Multiple previews start together (same cell);
+# MAGIC SQL already ran in §2 with overlap on the cluster.
 
 # COMMAND ----------
 
-# Warehouse recommendations
-if "warehouse" in results:
-    display(results["warehouse"])
-
-# COMMAND ----------
-
-# Query & table recommendations
-if "query_table" in results:
-    display(results["query_table"])
-
-# COMMAND ----------
-
-# Jobs → serverless candidacy
-if "jobs" in results:
-    display(results["jobs"])
+to_show = [q for q in selected if q in results and results[q] is not None]
+if to_show:
+    if len(to_show) == 1:
+        _show_result(to_show[0], results[to_show[0]])
+    else:
+        max_d = min(len(to_show), 16)
+        with ThreadPoolExecutor(max_workers=max_d) as ex:
+            futs = [ex.submit(_show_result, q, results[q]) for q in to_show]
+            wait(futs, return_when=ALL_COMPLETED)
+            for fut in futs:
+                fut.result()

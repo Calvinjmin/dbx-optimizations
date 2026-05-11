@@ -103,6 +103,20 @@ def run_sql_file(rel_path: str):
     return last
 
 
+def _run_and_materialize(rel_path: str):
+    """spark.sql('SELECT ...') is lazy — the query only runs when an action
+    (display, count, collect, ...) is called. In parallel mode, downstream
+    display() calls are in separate sequential cells, so without forcing
+    execution here the 'parallelism' would only cover plan-building. Calling
+    .cache() + .count() triggers execution inside the worker thread and
+    keeps the materialized result in memory for the later display()."""
+    df = run_sql_file(rel_path)
+    if df is not None:
+        df.cache()
+        df.count()
+    return df
+
+
 print(f"Repo root: {REPO_ROOT}")
 
 # COMMAND ----------
@@ -135,7 +149,9 @@ print(f"Selected: {selected} | mode: {mode}")
 
 if mode == "parallel" and len(selected) > 1:
     with ThreadPoolExecutor(max_workers=len(selected)) as ex:
-        futures = {q: ex.submit(run_sql_file, QUERY_FILES[q]) for q in selected}
+        futures = {
+            q: ex.submit(_run_and_materialize, QUERY_FILES[q]) for q in selected
+        }
         results = {q: f.result() for q, f in futures.items()}
 else:
     results = {q: run_sql_file(QUERY_FILES[q]) for q in selected}

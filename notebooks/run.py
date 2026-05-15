@@ -28,6 +28,15 @@ dbutils.widgets.multiselect(
     label="Queries to run",
 )
 
+# Auto-create / update + publish a Lakeview dashboard at the end of the run.
+# Turn off if you only want the in-notebook briefing.
+dbutils.widgets.dropdown(
+    "deploy_dashboard",
+    "yes",
+    ["yes", "no"],
+    label="Deploy Lakeview dashboard",
+)
+
 # COMMAND ----------
 
 _nb_path = (
@@ -479,3 +488,111 @@ if to_show:
             wait(futs, return_when=ALL_COMPLETED)
             for fut in futs:
                 fut.result()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Deploy Lakeview dashboard
+# MAGIC Idempotently creates / updates a published dashboard in this user's
+# MAGIC workspace. The dashboard datasets query system tables directly (same
+# MAGIC SQL as `queries/`, with `waf_config` inlined as a CTE), so no
+# MAGIC intermediate tables are written.
+
+# COMMAND ----------
+
+if dbutils.widgets.get("deploy_dashboard") == "yes":
+    import importlib.util
+    import json as _json
+
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.dashboards import Dashboard
+
+    # Import the dashboard generator from dashboards/build_dashboard.py without
+    # requiring the dashboards/ folder to be a Python package.
+    _spec = importlib.util.spec_from_file_location(
+        "build_dashboard",
+        os.path.join(REPO_ROOT, "dashboards", "build_dashboard.py"),
+    )
+    _build_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_build_mod)
+    serialized = _json.dumps(_build_mod.build_dashboard_dict())
+
+    w = WorkspaceClient()
+
+    # Pick a warehouse: prefer a running serverless one, then any serverless,
+    # then anything. Lakeview needs a warehouse_id to execute dataset queries.
+    _whs = list(w.warehouses.list())
+    _wh = (
+        next(
+            (
+                x
+                for x in _whs
+                if getattr(x, "enable_serverless_compute", False)
+                and getattr(x.state, "value", None) == "RUNNING"
+            ),
+            None,
+        )
+        or next(
+            (x for x in _whs if getattr(x, "enable_serverless_compute", False)),
+            None,
+        )
+        or (_whs[0] if _whs else None)
+    )
+    if _wh is None:
+        raise RuntimeError(
+            "No SQL warehouse available — create one (Serverless recommended) "
+            "and re-run."
+        )
+    warehouse_id = _wh.id
+
+    display_name = "WAF Recommendations"
+    parent_path = REPO_ROOT  # co-locate the dashboard with the repo
+
+    # Look up an existing dashboard at the same path with the same name so we
+    # update rather than duplicate on every run.
+    existing_id = None
+    for d in w.lakeview.list():
+        if (
+            d.display_name == display_name
+            and (d.parent_path or "").rstrip("/") == parent_path.rstrip("/")
+        ):
+            existing_id = d.dashboard_id
+            break
+
+    if existing_id:
+        result = w.lakeview.update(
+            dashboard_id=existing_id,
+            dashboard=Dashboard(
+                display_name=display_name,
+                warehouse_id=warehouse_id,
+                serialized_dashboard=serialized,
+            ),
+        )
+        action = "Updated"
+    else:
+        result = w.lakeview.create(
+            dashboard=Dashboard(
+                display_name=display_name,
+                warehouse_id=warehouse_id,
+                parent_path=parent_path,
+                serialized_dashboard=serialized,
+            )
+        )
+        action = "Created"
+
+    # Publish so the dashboard is viewable without opening it in edit mode.
+    try:
+        w.lakeview.publish(dashboard_id=result.dashboard_id, warehouse_id=warehouse_id)
+        published = True
+    except Exception as e:
+        # Non-fatal: the draft is still usable.
+        print(f"  publish skipped: {e}")
+        published = False
+
+    _host = w.config.host.rstrip("/")
+    print(f"{action} dashboard: {display_name}")
+    print(f"  Draft:     {_host}/dashboardsv3/{result.dashboard_id}/edit")
+    if published:
+        print(f"  Published: {_host}/dashboardsv3/{result.dashboard_id}/published")
+else:
+    print("Dashboard deploy skipped (widget set to 'no').")

@@ -4,5 +4,6 @@ venv/
 .vibe-demo.yaml
 .DS_Store
 
-./databricks.yml
+# Local bundle config — copied from databricks.example.yml and edited with
+# the user's workspace host + warehouse id. Not committed.
 databricks.yml

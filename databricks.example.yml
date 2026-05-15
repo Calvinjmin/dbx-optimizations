@@ -1,0 +1,67 @@
+# Databricks Asset Bundle — WAF Recommendations  (example template)
+#
+# Deploys the queries, runner notebook, and Lakeview dashboard into a
+# Databricks workspace. Docs: https://docs.databricks.com/dev-tools/bundles
+#
+# USAGE
+#   1. Copy this file to `databricks.yml`:
+#        cp databricks.example.yml databricks.yml
+#   2. Replace the two `default:` placeholders below with your workspace URL
+#      and a SQL warehouse ID, OR pass them as `--var` flags every deploy.
+#   3. databricks auth login --host https://<your-workspace>.cloud.databricks.com
+#   4. databricks bundle deploy
+#
+# `databricks.yml` is gitignored — your local edits stay on your machine.
+
+bundle:
+  name: waf-recommendations
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Variables — override at deploy time with `--var name=value`, or by setting
+# `BUNDLE_VAR_<name>` in your environment. To bake values in for everyone,
+# replace the `default:` values below.
+# ─────────────────────────────────────────────────────────────────────────────
+variables:
+  workspace_host:
+    description: >-
+      Your Databricks workspace URL (e.g. https://acme.cloud.databricks.com).
+      Used for both `dev` and `prod` targets unless you override per-target.
+    default: https://<your-workspace>.cloud.databricks.com
+
+  sql_warehouse_id:
+    description: >-
+      SQL warehouse the dashboard runs against. Serverless recommended for
+      lowest latency. Find an ID with `databricks warehouses list`.
+    default: <your-warehouse-id>
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources — what gets deployed. The dashboard is the primary artifact.
+# ─────────────────────────────────────────────────────────────────────────────
+resources:
+  dashboards:
+    waf_recommendations:
+      display_name: WAF Recommendations
+      file_path: ./dashboards/waf_recommendations.lvdash.json
+      warehouse_id: ${var.sql_warehouse_id}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Targets — one per environment. `dev` is the default; deploy to prod with
+# `databricks bundle deploy --target prod`. Override per-target by setting
+# `host:` explicitly instead of `${var.workspace_host}`.
+# ─────────────────────────────────────────────────────────────────────────────
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: ${var.workspace_host}
+
+  prod:
+    mode: production
+    workspace:
+      host: ${var.workspace_host}
+      # In production, bundle resources should typically be owned by a
+      # service principal so deploys don't tie ownership to a user.
+      # Uncomment and fill in to enable:
+      # run_as:
+      #   service_principal_name: <service-principal-application-id>

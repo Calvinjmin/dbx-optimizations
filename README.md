@@ -32,40 +32,29 @@ Run each of these once before you start.
 
 ## Deploy the dashboard (5 minutes)
 
-Follow these steps in order. Each command is copy-pasteable.
+Six steps, each copy-pasteable. Run them in order from the repo root.
 
-### Step 1 — Clone the repo
+### Step 1 — Clone the repo and copy the bundle config
 
 ```bash
 git clone <repo_url>
 cd waf-recommendations
+cp databricks.example.yml databricks.yml
 ```
 
-### Step 2 — Set your workspace URL in `databricks.yml`
+`databricks.yml` is gitignored — your edits in step 4 stay local. `databricks.example.yml` is the upstream template.
 
-Open `databricks.yml`. Find this line under `targets.dev.workspace`:
+### Step 2 — Authenticate the CLI
 
-```yaml
-host: https://<your-workspace>.cloud.databricks.com
-```
-
-Replace it with your workspace URL. Example:
-
-```yaml
-host: https://acme-corp.cloud.databricks.com
-```
-
-If you also plan to deploy to `prod`, replace the placeholder under `targets.prod.workspace` the same way.
-
-### Step 3 — Authenticate the CLI to your workspace
+Replace `<your-workspace>` with your actual workspace subdomain:
 
 ```bash
 databricks auth login --host https://<your-workspace>.cloud.databricks.com
 ```
 
-This opens a browser for OAuth and saves a profile in `~/.databrickscfg`. The `--host` value must match what you put in `databricks.yml`.
+This opens a browser for OAuth and saves a profile in `~/.databrickscfg`.
 
-### Step 4 — Pick a SQL warehouse
+### Step 3 — Pick a SQL warehouse
 
 ```bash
 databricks warehouses list
@@ -73,13 +62,35 @@ databricks warehouses list
 
 Copy the ID of a Serverless warehouse from the output (looks like `8baced1ff014912d`). The dashboard will run all of its datasets against this warehouse.
 
+### Step 4 — Set your values in `databricks.yml`
+
+Open `databricks.yml` and replace the two `default:` placeholders under `variables:`:
+
+```yaml
+variables:
+  workspace_host:
+    default: https://acme-corp.cloud.databricks.com    # ← your workspace URL
+  sql_warehouse_id:
+    default: 8baced1ff014912d                          # ← ID from step 3
+```
+
+Or, if you prefer not to edit the file, pass them as flags in step 5 instead.
+
 ### Step 5 — Deploy
 
 ```bash
-databricks bundle deploy --var sql_warehouse_id=<id_from_step_4>
+databricks bundle deploy
 ```
 
-The output ends with the workspace path where the dashboard was created, e.g. `/Workspace/Users/you@company.com/.bundle/waf-recommendations/dev/files`. Open the workspace in your browser, navigate there, and click the dashboard to view it.
+If you skipped step 4, pass the values inline:
+
+```bash
+databricks bundle deploy \
+  --var workspace_host=https://<your-workspace>.cloud.databricks.com \
+  --var sql_warehouse_id=<warehouse_id_from_step_3>
+```
+
+The output ends with the workspace path where the dashboard was created, e.g. `/Workspace/Users/you@company.com/.bundle/waf-recommendations/dev/files`. Open the workspace in your browser, navigate there, and click the dashboard.
 
 ### Step 6 — (Optional) Publish
 
@@ -128,7 +139,8 @@ For when you don't want the bundle deploy:
 ## Repository layout
 
 ```
-databricks.yml              Asset bundle definition (edit hosts before deploy)
+databricks.example.yml      Bundle template — copy to databricks.yml and edit
+databricks.yml              Your local bundle config (gitignored)
 queries/
   config.sql                Shared thresholds (waf_config view + session vars)
   warehouse_recommendations.sql

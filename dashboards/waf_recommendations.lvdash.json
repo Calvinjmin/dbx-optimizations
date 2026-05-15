@@ -4,21 +4,207 @@
       "name": "warehouse_recos",
       "displayName": "Warehouse recommendations",
       "queryLines": [
-        "WITH\nwaf_config AS (\n  SELECT\n    INTERVAL 30 DAYS AS lookback,\n    5     AS min_query_duration_s,\n    20    AS top_expensive_queries_n,\n    20    AS mv_min_executions,\n    300.0 AS mv_min_total_compute_s,\n    1.0   AS pruning_min_read_gb,\n    20.0  AS pruning_max_pct,\n    3     AS pruning_min_executions,\n    1.0   AS spill_min_avg_gb,\n    3     AS spill_min_executions,\n    50    AS hot_table_min_queries,\n    100.0 AS hot_table_min_compute_s,\n    5000  AS subsecond_min_queries,\n    5.0   AS subsecond_max_p50_s,\n    3     AS subsecond_min_distinct_users,\n    5.0   AS classic_startup_minutes,\n    25.0  AS min_classic_dbu_cost_30d,\n    3     AS min_runs_30d,\n    15.0  AS short_run_threshold_minutes,\n    90.0  AS long_run_threshold_minutes,\n    20    AS high_frequency_runs_30d,\n    25.0  AS high_startup_share_pct,\n    2.0   AS predictable_p95_p50_ratio,\n    5.0   AS unpredictable_p95_p50_ratio,\n    40    AS min_fit_score,\n    '^(test-|dev-|scratch-)' AS jobs_exclude_name_pattern,\n    map(\n      '2X_SMALL',  4.0,  'X_SMALL',   6.0,  'SMALL',    12.0,\n      'MEDIUM',   24.0,  'LARGE',    40.0,  'X_LARGE',  80.0,\n      '2X_LARGE',144.0,  '3X_LARGE',272.0,  '4X_LARGE',528.0\n    ) AS dbu_rate,\n    map('CLASSIC', 0.22, 'PRO', 0.55, 'SERVERLESS', 0.70) AS type_rate,\n    25.0  AS migration_min_idle_pct,\n    0.95  AS migration_max_cost_ratio,\n    0.1   AS size_up_min_spill_gb_per_query,\n    5.0   AS size_up_min_avg_queue_s,\n    30.0  AS size_down_max_p50_s,\n    60.0  AS size_down_max_p95_s,\n    5.0   AS size_down_max_avg_queue_s,\n    10    AS size_down_min_queries,\n    10.0  AS queries_per_cluster_target,\n    30    AS max_cluster_ceiling,\n    10    AS auto_stop_threshold_minutes,\n    10    AS auto_stop_target_minutes,\n    5.0   AS decommission_min_cost_30d,\n    0.05  AS cost_multiplier_floor,\n    80.0  AS raise_warn_high_util_pct,\n    30.0  AS raise_warn_modest_util_pct,\n    5.0   AS min_delta_threshold,\n    '^(lakebridge-warehouse-[0-9]+|cleanup-auto-created-warehouse)$'\n          AS warehouse_exclude_name_pattern\n),\n\ncurrent_warehouses AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type,\n         auto_stop_minutes, max_clusters, min_clusters\n  FROM system.compute.warehouses\n  QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) = 1\n),\n\nstate_windows AS (\n  SELECT warehouse_id, event_time AS w_start, cluster_count,\n         LEAD(event_time) OVER (PARTITION BY warehouse_id ORDER BY event_time) AS w_end\n  FROM system.compute.warehouse_events\n  WHERE event_time >= NOW() - (SELECT lookback FROM waf_config)\n),\n\non_time AS (\n  SELECT warehouse_id,\n         SUM(UNIX_TIMESTAMP(w_end) - UNIX_TIMESTAMP(w_start)) AS on_s,\n         SUM((UNIX_TIMESTAMP(w_end) - UNIX_TIMESTAMP(w_start)) * cluster_count) AS cluster_on_s,\n         MAX(cluster_count) AS max_clusters_observed\n  FROM state_windows\n  WHERE cluster_count > 0 AND w_end IS NOT NULL\n  GROUP BY warehouse_id\n),\n\nqueries AS (\n  SELECT compute.warehouse_id AS warehouse_id, start_time, end_time,\n         total_task_duration_ms, waiting_for_compute_duration_ms,\n         waiting_at_capacity_duration_ms, spilled_local_bytes\n  FROM system.query.history\n  WHERE start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND compute.warehouse_id IS NOT NULL\n),\n\nutilized_seconds AS (\n  SELECT s.warehouse_id,\n         SUM(UNIX_TIMESTAMP(LEAST(q.end_time, s.w_end))\n           - UNIX_TIMESTAMP(GREATEST(q.start_time, s.w_start))) AS util_s\n  FROM state_windows s JOIN queries q\n    ON q.warehouse_id = s.warehouse_id\n   AND q.start_time < s.w_end AND q.end_time > s.w_start\n  WHERE s.cluster_count > 0\n  GROUP BY s.warehouse_id\n),\n\nquery_stats AS (\n  SELECT warehouse_id,\n         COUNT(*) AS query_count,\n         PERCENTILE_APPROX(total_task_duration_ms/1000.0, 0.5)  AS p50_task_s,\n         PERCENTILE_APPROX(total_task_duration_ms/1000.0, 0.95) AS p95_task_s,\n         AVG(COALESCE(waiting_for_compute_duration_ms,0)\n           + COALESCE(waiting_at_capacity_duration_ms,0))/1000.0 AS avg_queue_s,\n         SUM(spilled_local_bytes)/POW(1024,3) AS spill_gb\n  FROM queries\n  GROUP BY warehouse_id\n),\n\nconcurrency AS (\n  SELECT warehouse_id, MAX(c) AS peak_concurrent\n  FROM (\n    SELECT warehouse_id, DATE_TRUNC('minute', start_time) AS m, COUNT(*) AS c\n    FROM queries GROUP BY 1, 2\n  )\n  GROUP BY warehouse_id\n),\n\ncost AS (\n  SELECT u.usage_metadata.warehouse_id AS warehouse_id,\n         SUM(u.usage_quantity) AS dbus_30d,\n         SUM(u.usage_quantity * p.pricing.effective_list.default) AS dollars_30d\n  FROM system.billing.usage u\n  LEFT JOIN system.billing.list_prices p\n    ON u.sku_name = p.sku_name AND u.usage_unit = p.usage_unit\n   AND u.usage_end_time BETWEEN p.price_start_time\n                            AND COALESCE(p.price_end_time, NOW() + INTERVAL 1 DAY)\n  WHERE u.usage_metadata.warehouse_id IS NOT NULL\n    AND u.usage_start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND p.currency_code = 'USD'\n  GROUP BY u.usage_metadata.warehouse_id\n),\n\nbase AS (\n  SELECT\n    w.warehouse_id, w.warehouse_name, w.warehouse_size, w.warehouse_type,\n    w.auto_stop_minutes, w.max_clusters, o.max_clusters_observed,\n    o.on_s / 3600.0 AS hours_on,\n    COALESCE(u.util_s, 0) / 3600.0 AS hours_utilized,\n    CASE\n      WHEN COALESCE(qs.query_count, 0) = 0 THEN NULL\n      ELSE LEAST(100.0,\n             ROUND(100.0 * COALESCE(u.util_s, 0) / NULLIF(o.cluster_on_s, 0), 1))\n    END AS util_pct,\n    GREATEST(0, o.on_s - COALESCE(u.util_s, 0)) / 3600.0 AS hours_idle,\n    qs.query_count, qs.p50_task_s, qs.p95_task_s, qs.avg_queue_s, qs.spill_gb,\n    c.peak_concurrent,\n    cost.dollars_30d, cost.dbus_30d\n  FROM current_warehouses w\n  LEFT JOIN on_time          o    USING (warehouse_id)\n  LEFT JOIN utilized_seconds u    USING (warehouse_id)\n  LEFT JOIN query_stats      qs   USING (warehouse_id)\n  LEFT JOIN concurrency      c    USING (warehouse_id)\n  LEFT JOIN cost             cost USING (warehouse_id)\n  WHERE o.on_s IS NOT NULL\n),\n\nrecos AS (\n  SELECT b.*,\n    CASE\n      WHEN warehouse_type = 'SERVERLESS' THEN warehouse_type\n      WHEN warehouse_type IN ('CLASSIC','PRO')\n       AND COALESCE((100.0 - util_pct), 100) > (SELECT migration_min_idle_pct FROM waf_config)\n       AND ((SELECT type_rate FROM waf_config)['SERVERLESS']\n            / NULLIF((SELECT type_rate FROM waf_config)[warehouse_type], 0))\n           * COALESCE(hours_utilized / NULLIF(hours_on, 0), 0)\n           < (SELECT migration_max_cost_ratio FROM waf_config)\n        THEN 'SERVERLESS'\n      ELSE warehouse_type\n    END AS rec_type,\n    CASE\n      WHEN spill_gb / NULLIF(query_count, 0) > (SELECT size_up_min_spill_gb_per_query FROM waf_config)\n        OR avg_queue_s > (SELECT size_up_min_avg_queue_s FROM waf_config) THEN\n        CASE warehouse_size\n          WHEN '2X_SMALL' THEN 'X_SMALL'  WHEN 'X_SMALL'  THEN 'SMALL'\n          WHEN 'SMALL'    THEN 'MEDIUM'   WHEN 'MEDIUM'   THEN 'LARGE'\n          WHEN 'LARGE'    THEN 'X_LARGE'  WHEN 'X_LARGE'  THEN '2X_LARGE'\n          WHEN '2X_LARGE' THEN '3X_LARGE' WHEN '3X_LARGE' THEN '4X_LARGE'\n          ELSE warehouse_size END\n      WHEN warehouse_size IN ('LARGE','X_LARGE','2X_LARGE','3X_LARGE','4X_LARGE')\n       AND p50_task_s   < (SELECT size_down_max_p50_s FROM waf_config)\n       AND p95_task_s   < (SELECT size_down_max_p95_s FROM waf_config)\n       AND avg_queue_s  < (SELECT size_down_max_avg_queue_s FROM waf_config)\n       AND COALESCE(spill_gb, 0) = 0\n       AND query_count >= (SELECT size_down_min_queries FROM waf_config)\n      THEN\n        CASE warehouse_size\n          WHEN 'LARGE'    THEN 'MEDIUM'   WHEN 'X_LARGE'  THEN 'LARGE'\n          WHEN '2X_LARGE' THEN 'X_LARGE'  WHEN '3X_LARGE' THEN '2X_LARGE'\n          WHEN '4X_LARGE' THEN '3X_LARGE' END\n      ELSE warehouse_size\n    END AS rec_size,\n    CASE\n      WHEN COALESCE(peak_concurrent, 0) = 0 THEN 1\n      WHEN spill_gb / NULLIF(query_count, 0) > (SELECT size_up_min_spill_gb_per_query FROM waf_config)\n        OR avg_queue_s > (SELECT size_up_min_avg_queue_s FROM waf_config)\n        THEN max_clusters\n      ELSE LEAST(\n        (SELECT max_cluster_ceiling FROM waf_config),\n        GREATEST(1, CAST(CEIL(peak_concurrent\n                              / (SELECT queries_per_cluster_target FROM waf_config)) AS INT))\n      )\n    END AS rec_max_clusters\n  FROM base b\n),\n\nprojected AS (\n  SELECT r.*,\n    GREATEST(\n      (SELECT cost_multiplier_floor FROM waf_config),\n      COALESCE(\n        (SELECT dbu_rate FROM waf_config)[rec_size]\n        / NULLIF((SELECT dbu_rate FROM waf_config)[warehouse_size], 0)\n      , 1.0)\n      *\n      COALESCE(\n        (SELECT type_rate FROM waf_config)[rec_type]\n        / NULLIF((SELECT type_rate FROM waf_config)[warehouse_type], 0)\n      , 1.0)\n      *\n      CASE\n        WHEN rec_type = 'SERVERLESS' AND warehouse_type != 'SERVERLESS'\n        THEN COALESCE(hours_utilized / NULLIF(hours_on, 0), 0)\n        ELSE 1.0\n      END\n    ) AS cost_multiplier\n  FROM recos r\n),\n\nfinal AS (\n  SELECT\n    CASE\n      WHEN COALESCE(query_count, 0) = 0\n       AND COALESCE(dollars_30d, 0) >= (SELECT decommission_min_cost_30d FROM waf_config)\n        THEN 'DECOMMISSION_CANDIDATE'\n      WHEN cost_multiplier < 1.0   THEN 'COST_REDUCE'\n      WHEN cost_multiplier > 1.0   THEN 'PERFORMANCE'\n      WHEN rec_max_clusters > max_clusters THEN 'CONCURRENCY'\n      WHEN rec_max_clusters < max_clusters THEN 'RIGHTSIZE'\n      WHEN auto_stop_minutes > (SELECT auto_stop_threshold_minutes FROM waf_config)\n       AND warehouse_type IN ('CLASSIC','PRO')\n        THEN 'HOUSEKEEPING'\n      ELSE NULL\n    END AS category,\n    CASE\n      WHEN COALESCE(query_count, 0) = 0\n       AND COALESCE(dollars_30d, 0) >= (SELECT decommission_min_cost_30d FROM waf_config)\n        THEN 'query_count = 0 AND dollars_30d >= decommission_min_cost_30d'\n      WHEN cost_multiplier < 1.0\n        THEN 'cost_multiplier < 1.0 (rec_size smaller OR migrate to serverless saves >= 5%) AND |delta| >= min_delta_threshold'\n      WHEN cost_multiplier > 1.0\n        THEN 'cost_multiplier > 1.0 (size-up: spill_per_query > size_up_min_spill_gb_per_query OR avg_queue > size_up_min_avg_queue_s) AND |delta| >= min_delta_threshold'\n      WHEN rec_max_clusters > max_clusters\n        THEN 'CEIL(peak_concurrent / queries_per_cluster_target) > current max_clusters (target capped at max_cluster_ceiling)'\n      WHEN rec_max_clusters < max_clusters\n        THEN 'CEIL(peak_concurrent / queries_per_cluster_target) < current max_clusters'\n      WHEN auto_stop_minutes > (SELECT auto_stop_threshold_minutes FROM waf_config)\n       AND warehouse_type IN ('CLASSIC','PRO')\n        THEN 'auto_stop_minutes > auto_stop_threshold_minutes AND warehouse_type IN (CLASSIC, PRO) AND no other action triggered'\n      ELSE NULL\n    END AS selection_criteria,\n    CASE\n      WHEN COALESCE(query_count, 0) = 0\n       AND COALESCE(dollars_30d, 0) >= (SELECT decommission_min_cost_30d FROM waf_config)\n        THEN CONCAT('DELETE - 0 queries / 30d, $',\n                    ROUND(COALESCE(dollars_30d, 0), 2), ' burned')\n      ELSE NULLIF(\n        CONCAT_WS(' + ',\n          CASE\n            WHEN rec_type != warehouse_type AND rec_size != warehouse_size THEN\n              CONCAT('MIGRATE ', warehouse_type, ' -> SERVERLESS + RESIZE ',\n                     warehouse_size, ' -> ', rec_size)\n            WHEN rec_type != warehouse_type THEN\n              CONCAT('MIGRATE ', warehouse_type, ' -> SERVERLESS')\n            WHEN rec_size != warehouse_size THEN\n              CONCAT('RESIZE ', warehouse_size, ' -> ', rec_size)\n          END,\n          CASE\n            WHEN rec_max_clusters > max_clusters THEN\n              CONCAT('RAISE max_clusters ', max_clusters, ' -> ', rec_max_clusters)\n            WHEN rec_max_clusters < max_clusters THEN\n              CONCAT('CAP max_clusters ', max_clusters, ' -> ', rec_max_clusters)\n          END,\n          CASE\n            WHEN auto_stop_minutes > (SELECT auto_stop_threshold_minutes FROM waf_config)\n             AND warehouse_type IN ('CLASSIC','PRO') THEN\n              CONCAT('AUTO-STOP ', auto_stop_minutes, 'm -> ',\n                     (SELECT auto_stop_target_minutes FROM waf_config), 'm')\n          END\n        ), '')\n    END AS recommended_action,\n    warehouse_id, warehouse_name,\n    warehouse_size AS current_size, rec_size,\n    warehouse_type AS current_type, rec_type,\n    max_clusters   AS current_max_clusters, rec_max_clusters,\n    auto_stop_minutes,\n    util_pct AS utilization_pct,\n    ROUND(hours_idle, 1) AS idle_hours_30d,\n    query_count,\n    ROUND(p50_task_s, 1) AS p50_task_s,\n    ROUND(p95_task_s, 1) AS p95_task_s,\n    ROUND(avg_queue_s, 1) AS avg_queue_s,\n    ROUND(spill_gb, 2)    AS spill_gb,\n    peak_concurrent,\n    CAST(ROUND(dollars_30d, 2) AS DOUBLE)                          AS current_cost_30d,\n    CAST(ROUND(dollars_30d * cost_multiplier, 2) AS DOUBLE)        AS projected_cost_30d,\n    CAST(ROUND(dollars_30d * (1 - cost_multiplier), 2) AS DOUBLE)  AS projected_cost_delta_30d,\n    CAST(ROUND(100.0 * (1 - cost_multiplier), 1) AS DOUBLE)        AS cost_delta_pct\n  FROM projected\n)\n\nSELECT\n  category,\n  selection_criteria,\n  recommended_action,\n  warehouse_id, warehouse_name,\n  current_size, rec_size, current_type, rec_type,\n  current_max_clusters, rec_max_clusters,\n  auto_stop_minutes,\n  utilization_pct, idle_hours_30d,\n  query_count, p50_task_s, p95_task_s, avg_queue_s, spill_gb, peak_concurrent,\n  current_cost_30d, projected_cost_30d, projected_cost_delta_30d, cost_delta_pct,\n  -- Headline savings field used by KPIs and charts.\n  -- DECOMMISSION rows show no cost_multiplier delta (the warehouse stays the same\n  -- size on paper) so we surface the full current_cost_30d as the realized\n  -- savings opportunity once it's deleted.\n  CASE\n    WHEN category = 'DECOMMISSION_CANDIDATE' THEN current_cost_30d\n    ELSE GREATEST(0, projected_cost_delta_30d)\n  END AS effective_savings_30d\nFROM final\nWHERE category IS NOT NULL\n  AND recommended_action IS NOT NULL\n  AND warehouse_name NOT RLIKE '^(lakebridge-warehouse-[0-9]+|cleanup-auto-created-warehouse)$'\n  AND (\n    category IN ('DECOMMISSION_CANDIDATE','CONCURRENCY','RIGHTSIZE','HOUSEKEEPING')\n    OR (category IN ('COST_REDUCE','PERFORMANCE')\n        AND ABS(projected_cost_delta_30d) >= 5.0)\n  )\n"
+        "WITH\nwaf_config AS (\n  SELECT\n    -- Values marked with `:` are dashboard parameters \u2014 exposed as input\n    -- widgets on the Filters page. Edit the defaults in PARAM_DECLS below.\n    make_dt_interval(:lookback_days) AS lookback,\n    :min_query_duration_s              AS min_query_duration_s,\n    20    AS top_expensive_queries_n,\n    20    AS mv_min_executions,\n    300.0 AS mv_min_total_compute_s,\n    1.0   AS pruning_min_read_gb,\n    20.0  AS pruning_max_pct,\n    3     AS pruning_min_executions,\n    1.0   AS spill_min_avg_gb,\n    3     AS spill_min_executions,\n    50    AS hot_table_min_queries,\n    100.0 AS hot_table_min_compute_s,\n    5000  AS subsecond_min_queries,\n    5.0   AS subsecond_max_p50_s,\n    3     AS subsecond_min_distinct_users,\n    5.0   AS classic_startup_minutes,\n    :min_classic_dbu_cost_30d AS min_classic_dbu_cost_30d,\n    3     AS min_runs_30d,\n    15.0  AS short_run_threshold_minutes,\n    90.0  AS long_run_threshold_minutes,\n    20    AS high_frequency_runs_30d,\n    25.0  AS high_startup_share_pct,\n    2.0   AS predictable_p95_p50_ratio,\n    5.0   AS unpredictable_p95_p50_ratio,\n    :min_fit_score AS min_fit_score,\n    '^(test-|dev-|scratch-)' AS jobs_exclude_name_pattern,\n    map(\n      '2X_SMALL',  4.0,  'X_SMALL',   6.0,  'SMALL',    12.0,\n      'MEDIUM',   24.0,  'LARGE',    40.0,  'X_LARGE',  80.0,\n      '2X_LARGE',144.0,  '3X_LARGE',272.0,  '4X_LARGE',528.0\n    ) AS dbu_rate,\n    map('CLASSIC', 0.22, 'PRO', 0.55, 'SERVERLESS', 0.70) AS type_rate,\n    25.0  AS migration_min_idle_pct,\n    0.95  AS migration_max_cost_ratio,\n    0.1   AS size_up_min_spill_gb_per_query,\n    5.0   AS size_up_min_avg_queue_s,\n    30.0  AS size_down_max_p50_s,\n    60.0  AS size_down_max_p95_s,\n    5.0   AS size_down_max_avg_queue_s,\n    10    AS size_down_min_queries,\n    10.0  AS queries_per_cluster_target,\n    30    AS max_cluster_ceiling,\n    10    AS auto_stop_threshold_minutes,\n    10    AS auto_stop_target_minutes,\n    5.0   AS decommission_min_cost_30d,\n    0.05  AS cost_multiplier_floor,\n    80.0  AS raise_warn_high_util_pct,\n    30.0  AS raise_warn_modest_util_pct,\n    5.0   AS min_delta_threshold,\n    '^(lakebridge-warehouse-[0-9]+|cleanup-auto-created-warehouse)$'\n          AS warehouse_exclude_name_pattern\n),\n\ncurrent_warehouses AS (\n  SELECT warehouse_id, warehouse_name, warehouse_size, warehouse_type,\n         auto_stop_minutes, max_clusters, min_clusters\n  FROM system.compute.warehouses\n  QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) = 1\n),\n\nstate_windows AS (\n  SELECT warehouse_id, event_time AS w_start, cluster_count,\n         LEAD(event_time) OVER (PARTITION BY warehouse_id ORDER BY event_time) AS w_end\n  FROM system.compute.warehouse_events\n  WHERE event_time >= NOW() - (SELECT lookback FROM waf_config)\n),\n\non_time AS (\n  SELECT warehouse_id,\n         SUM(UNIX_TIMESTAMP(w_end) - UNIX_TIMESTAMP(w_start)) AS on_s,\n         SUM((UNIX_TIMESTAMP(w_end) - UNIX_TIMESTAMP(w_start)) * cluster_count) AS cluster_on_s,\n         MAX(cluster_count) AS max_clusters_observed\n  FROM state_windows\n  WHERE cluster_count > 0 AND w_end IS NOT NULL\n  GROUP BY warehouse_id\n),\n\nqueries AS (\n  SELECT compute.warehouse_id AS warehouse_id, start_time, end_time,\n         total_task_duration_ms, waiting_for_compute_duration_ms,\n         waiting_at_capacity_duration_ms, spilled_local_bytes\n  FROM system.query.history\n  WHERE start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND compute.warehouse_id IS NOT NULL\n),\n\nutilized_seconds AS (\n  SELECT s.warehouse_id,\n         SUM(UNIX_TIMESTAMP(LEAST(q.end_time, s.w_end))\n           - UNIX_TIMESTAMP(GREATEST(q.start_time, s.w_start))) AS util_s\n  FROM state_windows s JOIN queries q\n    ON q.warehouse_id = s.warehouse_id\n   AND q.start_time < s.w_end AND q.end_time > s.w_start\n  WHERE s.cluster_count > 0\n  GROUP BY s.warehouse_id\n),\n\nquery_stats AS (\n  SELECT warehouse_id,\n         COUNT(*) AS query_count,\n         PERCENTILE_APPROX(total_task_duration_ms/1000.0, 0.5)  AS p50_task_s,\n         PERCENTILE_APPROX(total_task_duration_ms/1000.0, 0.95) AS p95_task_s,\n         AVG(COALESCE(waiting_for_compute_duration_ms,0)\n           + COALESCE(waiting_at_capacity_duration_ms,0))/1000.0 AS avg_queue_s,\n         SUM(spilled_local_bytes)/POW(1024,3) AS spill_gb\n  FROM queries\n  GROUP BY warehouse_id\n),\n\nconcurrency AS (\n  SELECT warehouse_id, MAX(c) AS peak_concurrent\n  FROM (\n    SELECT warehouse_id, DATE_TRUNC('minute', start_time) AS m, COUNT(*) AS c\n    FROM queries GROUP BY 1, 2\n  )\n  GROUP BY warehouse_id\n),\n\ncost AS (\n  SELECT u.usage_metadata.warehouse_id AS warehouse_id,\n         SUM(u.usage_quantity) AS dbus_30d,\n         SUM(u.usage_quantity * p.pricing.effective_list.default) AS dollars_30d\n  FROM system.billing.usage u\n  LEFT JOIN system.billing.list_prices p\n    ON u.sku_name = p.sku_name AND u.usage_unit = p.usage_unit\n   AND u.usage_end_time BETWEEN p.price_start_time\n                            AND COALESCE(p.price_end_time, NOW() + INTERVAL 1 DAY)\n  WHERE u.usage_metadata.warehouse_id IS NOT NULL\n    AND u.usage_start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND p.currency_code = 'USD'\n  GROUP BY u.usage_metadata.warehouse_id\n),\n\nbase AS (\n  SELECT\n    w.warehouse_id, w.warehouse_name, w.warehouse_size, w.warehouse_type,\n    w.auto_stop_minutes, w.max_clusters, o.max_clusters_observed,\n    o.on_s / 3600.0 AS hours_on,\n    COALESCE(u.util_s, 0) / 3600.0 AS hours_utilized,\n    CASE\n      WHEN COALESCE(qs.query_count, 0) = 0 THEN NULL\n      ELSE LEAST(100.0,\n             ROUND(100.0 * COALESCE(u.util_s, 0) / NULLIF(o.cluster_on_s, 0), 1))\n    END AS util_pct,\n    GREATEST(0, o.on_s - COALESCE(u.util_s, 0)) / 3600.0 AS hours_idle,\n    qs.query_count, qs.p50_task_s, qs.p95_task_s, qs.avg_queue_s, qs.spill_gb,\n    c.peak_concurrent,\n    cost.dollars_30d, cost.dbus_30d\n  FROM current_warehouses w\n  LEFT JOIN on_time          o    USING (warehouse_id)\n  LEFT JOIN utilized_seconds u    USING (warehouse_id)\n  LEFT JOIN query_stats      qs   USING (warehouse_id)\n  LEFT JOIN concurrency      c    USING (warehouse_id)\n  LEFT JOIN cost             cost USING (warehouse_id)\n  WHERE o.on_s IS NOT NULL\n),\n\nrecos AS (\n  SELECT b.*,\n    CASE\n      WHEN warehouse_type = 'SERVERLESS' THEN warehouse_type\n      WHEN warehouse_type IN ('CLASSIC','PRO')\n       AND COALESCE((100.0 - util_pct), 100) > (SELECT migration_min_idle_pct FROM waf_config)\n       AND ((SELECT type_rate FROM waf_config)['SERVERLESS']\n            / NULLIF((SELECT type_rate FROM waf_config)[warehouse_type], 0))\n           * COALESCE(hours_utilized / NULLIF(hours_on, 0), 0)\n           < (SELECT migration_max_cost_ratio FROM waf_config)\n        THEN 'SERVERLESS'\n      ELSE warehouse_type\n    END AS rec_type,\n    CASE\n      WHEN spill_gb / NULLIF(query_count, 0) > (SELECT size_up_min_spill_gb_per_query FROM waf_config)\n        OR avg_queue_s > (SELECT size_up_min_avg_queue_s FROM waf_config) THEN\n        CASE warehouse_size\n          WHEN '2X_SMALL' THEN 'X_SMALL'  WHEN 'X_SMALL'  THEN 'SMALL'\n          WHEN 'SMALL'    THEN 'MEDIUM'   WHEN 'MEDIUM'   THEN 'LARGE'\n          WHEN 'LARGE'    THEN 'X_LARGE'  WHEN 'X_LARGE'  THEN '2X_LARGE'\n          WHEN '2X_LARGE' THEN '3X_LARGE' WHEN '3X_LARGE' THEN '4X_LARGE'\n          ELSE warehouse_size END\n      WHEN warehouse_size IN ('LARGE','X_LARGE','2X_LARGE','3X_LARGE','4X_LARGE')\n       AND p50_task_s   < (SELECT size_down_max_p50_s FROM waf_config)\n       AND p95_task_s   < (SELECT size_down_max_p95_s FROM waf_config)\n       AND avg_queue_s  < (SELECT size_down_max_avg_queue_s FROM waf_config)\n       AND COALESCE(spill_gb, 0) = 0\n       AND query_count >= (SELECT size_down_min_queries FROM waf_config)\n      THEN\n        CASE warehouse_size\n          WHEN 'LARGE'    THEN 'MEDIUM'   WHEN 'X_LARGE'  THEN 'LARGE'\n          WHEN '2X_LARGE' THEN 'X_LARGE'  WHEN '3X_LARGE' THEN '2X_LARGE'\n          WHEN '4X_LARGE' THEN '3X_LARGE' END\n      ELSE warehouse_size\n    END AS rec_size,\n    CASE\n      WHEN COALESCE(peak_concurrent, 0) = 0 THEN 1\n      WHEN spill_gb / NULLIF(query_count, 0) > (SELECT size_up_min_spill_gb_per_query FROM waf_config)\n        OR avg_queue_s > (SELECT size_up_min_avg_queue_s FROM waf_config)\n        THEN max_clusters\n      ELSE LEAST(\n        (SELECT max_cluster_ceiling FROM waf_config),\n        GREATEST(1, CAST(CEIL(peak_concurrent\n                              / (SELECT queries_per_cluster_target FROM waf_config)) AS INT))\n      )\n    END AS rec_max_clusters\n  FROM base b\n),\n\nprojected AS (\n  SELECT r.*,\n    GREATEST(\n      (SELECT cost_multiplier_floor FROM waf_config),\n      COALESCE(\n        (SELECT dbu_rate FROM waf_config)[rec_size]\n        / NULLIF((SELECT dbu_rate FROM waf_config)[warehouse_size], 0)\n      , 1.0)\n      *\n      COALESCE(\n        (SELECT type_rate FROM waf_config)[rec_type]\n        / NULLIF((SELECT type_rate FROM waf_config)[warehouse_type], 0)\n      , 1.0)\n      *\n      CASE\n        WHEN rec_type = 'SERVERLESS' AND warehouse_type != 'SERVERLESS'\n        THEN COALESCE(hours_utilized / NULLIF(hours_on, 0), 0)\n        ELSE 1.0\n      END\n    ) AS cost_multiplier\n  FROM recos r\n),\n\nfinal AS (\n  SELECT\n    CASE\n      WHEN COALESCE(query_count, 0) = 0\n       AND COALESCE(dollars_30d, 0) >= (SELECT decommission_min_cost_30d FROM waf_config)\n        THEN 'DECOMMISSION_CANDIDATE'\n      WHEN cost_multiplier < 1.0   THEN 'COST_REDUCE'\n      WHEN cost_multiplier > 1.0   THEN 'PERFORMANCE'\n      WHEN rec_max_clusters > max_clusters THEN 'CONCURRENCY'\n      WHEN rec_max_clusters < max_clusters THEN 'RIGHTSIZE'\n      WHEN auto_stop_minutes > (SELECT auto_stop_threshold_minutes FROM waf_config)\n       AND warehouse_type IN ('CLASSIC','PRO')\n        THEN 'HOUSEKEEPING'\n      ELSE NULL\n    END AS category,\n    CASE\n      WHEN COALESCE(query_count, 0) = 0\n       AND COALESCE(dollars_30d, 0) >= (SELECT decommission_min_cost_30d FROM waf_config)\n        THEN 'query_count = 0 AND dollars_30d >= decommission_min_cost_30d'\n      WHEN cost_multiplier < 1.0\n        THEN 'cost_multiplier < 1.0 (rec_size smaller OR migrate to serverless saves >= 5%) AND |delta| >= min_delta_threshold'\n      WHEN cost_multiplier > 1.0\n        THEN 'cost_multiplier > 1.0 (size-up: spill_per_query > size_up_min_spill_gb_per_query OR avg_queue > size_up_min_avg_queue_s) AND |delta| >= min_delta_threshold'\n      WHEN rec_max_clusters > max_clusters\n        THEN 'CEIL(peak_concurrent / queries_per_cluster_target) > current max_clusters (target capped at max_cluster_ceiling)'\n      WHEN rec_max_clusters < max_clusters\n        THEN 'CEIL(peak_concurrent / queries_per_cluster_target) < current max_clusters'\n      WHEN auto_stop_minutes > (SELECT auto_stop_threshold_minutes FROM waf_config)\n       AND warehouse_type IN ('CLASSIC','PRO')\n        THEN 'auto_stop_minutes > auto_stop_threshold_minutes AND warehouse_type IN (CLASSIC, PRO) AND no other action triggered'\n      ELSE NULL\n    END AS selection_criteria,\n    CASE\n      WHEN COALESCE(query_count, 0) = 0\n       AND COALESCE(dollars_30d, 0) >= (SELECT decommission_min_cost_30d FROM waf_config)\n        THEN CONCAT('DELETE - 0 queries / 30d, $',\n                    ROUND(COALESCE(dollars_30d, 0), 2), ' burned')\n      ELSE NULLIF(\n        CONCAT_WS(' + ',\n          CASE\n            WHEN rec_type != warehouse_type AND rec_size != warehouse_size THEN\n              CONCAT('MIGRATE ', warehouse_type, ' -> SERVERLESS + RESIZE ',\n                     warehouse_size, ' -> ', rec_size)\n            WHEN rec_type != warehouse_type THEN\n              CONCAT('MIGRATE ', warehouse_type, ' -> SERVERLESS')\n            WHEN rec_size != warehouse_size THEN\n              CONCAT('RESIZE ', warehouse_size, ' -> ', rec_size)\n          END,\n          CASE\n            WHEN rec_max_clusters > max_clusters THEN\n              CONCAT('RAISE max_clusters ', max_clusters, ' -> ', rec_max_clusters)\n            WHEN rec_max_clusters < max_clusters THEN\n              CONCAT('CAP max_clusters ', max_clusters, ' -> ', rec_max_clusters)\n          END,\n          CASE\n            WHEN auto_stop_minutes > (SELECT auto_stop_threshold_minutes FROM waf_config)\n             AND warehouse_type IN ('CLASSIC','PRO') THEN\n              CONCAT('AUTO-STOP ', auto_stop_minutes, 'm -> ',\n                     (SELECT auto_stop_target_minutes FROM waf_config), 'm')\n          END\n        ), '')\n    END AS recommended_action,\n    warehouse_id, warehouse_name,\n    warehouse_size AS current_size, rec_size,\n    warehouse_type AS current_type, rec_type,\n    max_clusters   AS current_max_clusters, rec_max_clusters,\n    auto_stop_minutes,\n    util_pct AS utilization_pct,\n    ROUND(hours_idle, 1) AS idle_hours_30d,\n    query_count,\n    ROUND(p50_task_s, 1) AS p50_task_s,\n    ROUND(p95_task_s, 1) AS p95_task_s,\n    ROUND(avg_queue_s, 1) AS avg_queue_s,\n    ROUND(spill_gb, 2)    AS spill_gb,\n    peak_concurrent,\n    CAST(ROUND(dollars_30d, 2) AS DOUBLE)                          AS current_cost_30d,\n    CAST(ROUND(dollars_30d * cost_multiplier, 2) AS DOUBLE)        AS projected_cost_30d,\n    CAST(ROUND(dollars_30d * (1 - cost_multiplier), 2) AS DOUBLE)  AS projected_cost_delta_30d,\n    CAST(ROUND(100.0 * (1 - cost_multiplier), 1) AS DOUBLE)        AS cost_delta_pct\n  FROM projected\n)\n\nSELECT\n  category,\n  selection_criteria,\n  recommended_action,\n  warehouse_id, warehouse_name,\n  current_size, rec_size, current_type, rec_type,\n  current_max_clusters, rec_max_clusters,\n  auto_stop_minutes,\n  utilization_pct, idle_hours_30d,\n  query_count, p50_task_s, p95_task_s, avg_queue_s, spill_gb, peak_concurrent,\n  current_cost_30d, projected_cost_30d, projected_cost_delta_30d, cost_delta_pct,\n  -- Headline savings field used by KPIs and charts.\n  -- DECOMMISSION rows show no cost_multiplier delta (the warehouse stays the same\n  -- size on paper) so we surface the full current_cost_30d as the realized\n  -- savings opportunity once it's deleted.\n  CASE\n    WHEN category = 'DECOMMISSION_CANDIDATE' THEN current_cost_30d\n    ELSE GREATEST(0, projected_cost_delta_30d)\n  END AS effective_savings_30d\nFROM final\nWHERE category IS NOT NULL\n  AND recommended_action IS NOT NULL\n  AND warehouse_name NOT RLIKE '^(lakebridge-warehouse-[0-9]+|cleanup-auto-created-warehouse)$'\n  AND (\n    category IN ('DECOMMISSION_CANDIDATE','CONCURRENCY','RIGHTSIZE','HOUSEKEEPING')\n    OR (category IN ('COST_REDUCE','PERFORMANCE')\n        AND ABS(projected_cost_delta_30d) >= 5.0)\n  )\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Lookback (days)",
+          "keyword": "lookback_days",
+          "dataType": "INTEGER",
+          "defaultSelection": {
+            "values": {
+              "dataType": "INTEGER",
+              "values": [
+                {
+                  "value": "30"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Min query duration (s)",
+          "keyword": "min_query_duration_s",
+          "dataType": "INTEGER",
+          "defaultSelection": {
+            "values": {
+              "dataType": "INTEGER",
+              "values": [
+                {
+                  "value": "5"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Min job fit score",
+          "keyword": "min_fit_score",
+          "dataType": "INTEGER",
+          "defaultSelection": {
+            "values": {
+              "dataType": "INTEGER",
+              "values": [
+                {
+                  "value": "40"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Min job cost 30d ($)",
+          "keyword": "min_classic_dbu_cost_30d",
+          "dataType": "DECIMAL",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DECIMAL",
+              "values": [
+                {
+                  "value": "25.0"
+                }
+              ]
+            }
+          }
+        }
       ]
     },
     {
       "name": "query_table_recos",
       "displayName": "Query / table recommendations",
       "queryLines": [
-        "WITH\nwaf_config AS (\n  SELECT\n    INTERVAL 30 DAYS AS lookback,\n    5     AS min_query_duration_s,\n    20    AS top_expensive_queries_n,\n    20    AS mv_min_executions,\n    300.0 AS mv_min_total_compute_s,\n    1.0   AS pruning_min_read_gb,\n    20.0  AS pruning_max_pct,\n    3     AS pruning_min_executions,\n    1.0   AS spill_min_avg_gb,\n    3     AS spill_min_executions,\n    50    AS hot_table_min_queries,\n    100.0 AS hot_table_min_compute_s,\n    5000  AS subsecond_min_queries,\n    5.0   AS subsecond_max_p50_s,\n    3     AS subsecond_min_distinct_users,\n    5.0   AS classic_startup_minutes,\n    25.0  AS min_classic_dbu_cost_30d,\n    3     AS min_runs_30d,\n    15.0  AS short_run_threshold_minutes,\n    90.0  AS long_run_threshold_minutes,\n    20    AS high_frequency_runs_30d,\n    25.0  AS high_startup_share_pct,\n    2.0   AS predictable_p95_p50_ratio,\n    5.0   AS unpredictable_p95_p50_ratio,\n    40    AS min_fit_score,\n    '^(test-|dev-|scratch-)' AS jobs_exclude_name_pattern,\n    map(\n      '2X_SMALL',  4.0,  'X_SMALL',   6.0,  'SMALL',    12.0,\n      'MEDIUM',   24.0,  'LARGE',    40.0,  'X_LARGE',  80.0,\n      '2X_LARGE',144.0,  '3X_LARGE',272.0,  '4X_LARGE',528.0\n    ) AS dbu_rate,\n    map('CLASSIC', 0.22, 'PRO', 0.55, 'SERVERLESS', 0.70) AS type_rate,\n    25.0  AS migration_min_idle_pct,\n    0.95  AS migration_max_cost_ratio,\n    0.1   AS size_up_min_spill_gb_per_query,\n    5.0   AS size_up_min_avg_queue_s,\n    30.0  AS size_down_max_p50_s,\n    60.0  AS size_down_max_p95_s,\n    5.0   AS size_down_max_avg_queue_s,\n    10    AS size_down_min_queries,\n    10.0  AS queries_per_cluster_target,\n    30    AS max_cluster_ceiling,\n    10    AS auto_stop_threshold_minutes,\n    10    AS auto_stop_target_minutes,\n    5.0   AS decommission_min_cost_30d,\n    0.05  AS cost_multiplier_floor,\n    80.0  AS raise_warn_high_util_pct,\n    30.0  AS raise_warn_modest_util_pct,\n    5.0   AS min_delta_threshold,\n    '^(lakebridge-warehouse-[0-9]+|cleanup-auto-created-warehouse)$'\n          AS warehouse_exclude_name_pattern\n),\n\nwarehouse_names AS (\n  SELECT warehouse_id, warehouse_name\n  FROM system.compute.warehouses\n  QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) = 1\n),\n\nall_queries AS (\n  SELECT\n    statement_id, executed_by,\n    compute.warehouse_id AS warehouse_id,\n    start_time, total_task_duration_ms, read_bytes, client_application\n  FROM system.query.history\n  WHERE start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND statement_type = 'SELECT'\n    AND execution_status = 'FINISHED'\n),\n\nheavy_queries AS (\n  SELECT\n    aq.statement_id, aq.executed_by, aq.warehouse_id, aq.start_time,\n    aq.total_task_duration_ms, aq.read_bytes,\n    h.statement_text AS query_text,\n    h.pruned_files_bytes AS pruned_bytes,\n    h.spilled_local_bytes,\n    md5(REGEXP_REPLACE(\n          REGEXP_REPLACE(\n            REGEXP_REPLACE(LOWER(h.statement_text), \"'[^']*'\", '?'),\n            '\\\\b\\\\d+\\\\b', '?'),\n          '\\\\s+', ' ')) AS query_signature\n  FROM all_queries aq\n  JOIN system.query.history h USING (statement_id)\n  WHERE aq.total_task_duration_ms > (SELECT min_query_duration_s * 1000 FROM waf_config)\n    AND h.statement_text IS NOT NULL\n),\n\ntop_expensive_queries AS (\n  SELECT *\n  FROM (\n    SELECT\n      'EXPENSIVE_QUERY_REVIEW' AS category,\n      'top N query signatures by SUM(total_task_duration_ms)' AS selection_criteria,\n      CONCAT('Top query - ', COUNT(*), ' runs, ',\n             ROUND(SUM(total_task_duration_ms) / 60000.0, 1), ' min total. ',\n             'Open the query profile / review with AI for tuning.') AS recommended_action,\n      CAST(NULL AS STRING) AS target,\n      SUBSTR(MIN(query_text), 1, 300) AS query_sample,\n      COUNT(*) AS exec_count,\n      ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n      ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n      CAST(NULL AS DOUBLE) AS avg_spill_gb,\n      CAST(NULL AS DOUBLE) AS pruning_pct,\n      ROUND(SUM(read_bytes) / POW(1024, 3), 2) AS total_read_gb\n    FROM heavy_queries\n    GROUP BY query_signature\n  )\n  QUALIFY ROW_NUMBER() OVER (ORDER BY total_compute_s DESC)\n    <= (SELECT top_expensive_queries_n FROM waf_config)\n),\n\nmv_candidates AS (\n  SELECT\n    'MATERIALIZED_VIEW_CANDIDATE' AS category,\n    'same query signature: COUNT(*) >= mv_min_executions AND total compute >= mv_min_total_compute_s' AS selection_criteria,\n    CONCAT('Run ', COUNT(*), 'x - total ',\n           ROUND(SUM(total_task_duration_ms) / 60000.0, 1), ' min compute. ',\n           'CREATE MATERIALIZED VIEW.') AS recommended_action,\n    CAST(NULL AS STRING) AS target,\n    SUBSTR(MIN(query_text), 1, 300) AS query_sample,\n    COUNT(*) AS exec_count,\n    ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n    CAST(NULL AS DOUBLE) AS avg_spill_gb,\n    CAST(NULL AS DOUBLE) AS pruning_pct,\n    ROUND(SUM(read_bytes) / POW(1024, 3), 2) AS total_read_gb\n  FROM heavy_queries\n  GROUP BY query_signature\n  HAVING COUNT(*) >= (SELECT mv_min_executions FROM waf_config)\n     AND SUM(total_task_duration_ms) / 1000.0 >= (SELECT mv_min_total_compute_s FROM waf_config)\n),\n\nlow_pruning_queries AS (\n  SELECT\n    'LIQUID_CLUSTERING_CANDIDATE' AS category,\n    'per-query read_bytes >= pruning_min_read_gb AND COUNT(*) >= pruning_min_executions AND aggregate pruning% < pruning_max_pct' AS selection_criteria,\n    CONCAT('Reads ', ROUND(SUM(read_bytes) / POW(1024, 3), 1),\n           ' GB with only ',\n           ROUND(SUM(pruned_bytes) * 100.0\n                 / NULLIF(SUM(read_bytes) + SUM(pruned_bytes), 0), 1),\n           '% pruned over ', COUNT(*), ' runs. ',\n           'ALTER TABLE ... CLUSTER BY (filter columns).') AS recommended_action,\n    CAST(NULL AS STRING) AS target,\n    SUBSTR(MIN(query_text), 1, 300) AS query_sample,\n    COUNT(*) AS exec_count,\n    ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n    CAST(NULL AS DOUBLE) AS avg_spill_gb,\n    ROUND(SUM(pruned_bytes) * 100.0\n          / NULLIF(SUM(read_bytes) + SUM(pruned_bytes), 0), 1) AS pruning_pct,\n    ROUND(SUM(read_bytes) / POW(1024, 3), 2) AS total_read_gb\n  FROM heavy_queries\n  WHERE read_bytes >= (SELECT pruning_min_read_gb FROM waf_config) * POW(1024, 3)\n  GROUP BY query_signature\n  HAVING COUNT(*) >= (SELECT pruning_min_executions FROM waf_config)\n     AND SUM(pruned_bytes) * 100.0\n         / NULLIF(SUM(read_bytes) + SUM(pruned_bytes), 0)\n         < (SELECT pruning_max_pct FROM waf_config)\n),\n\nspill_queries AS (\n  SELECT\n    'HIGH_SPILL_QUERY' AS category,\n    'per-row spilled_local_bytes > 0 AND COUNT(*) >= spill_min_executions AND AVG(spill GB) >= spill_min_avg_gb' AS selection_criteria,\n    CONCAT('Avg ', ROUND(AVG(spilled_local_bytes) / POW(1024, 3), 1),\n           ' GB spill / query over ', COUNT(*), ' runs. ',\n           'Size up warehouse or rewrite (broadcast joins, narrow projections).') AS recommended_action,\n    CAST(NULL AS STRING) AS target,\n    SUBSTR(MIN(query_text), 1, 300) AS query_sample,\n    COUNT(*) AS exec_count,\n    ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n    ROUND(AVG(spilled_local_bytes) / POW(1024, 3), 2) AS avg_spill_gb,\n    CAST(NULL AS DOUBLE) AS pruning_pct,\n    CAST(NULL AS DOUBLE) AS total_read_gb\n  FROM heavy_queries\n  WHERE spilled_local_bytes > 0\n  GROUP BY query_signature\n  HAVING COUNT(*) >= (SELECT spill_min_executions FROM waf_config)\n     AND AVG(spilled_local_bytes) / POW(1024, 3) >= (SELECT spill_min_avg_gb FROM waf_config)\n),\n\nhot_tables AS (\n  SELECT\n    'HOT_TABLE_REVIEW' AS category,\n    'per source_table_full_name: COUNT(DISTINCT entity_id) >= hot_table_min_queries AND total compute >= hot_table_min_compute_s' AS selection_criteria,\n    CONCAT('Read by ', COUNT(DISTINCT tl.entity_id), ' queries / ',\n           COUNT(DISTINCT tl.created_by), ' users. ',\n           'High-leverage target - review LIQUID CLUSTERING + ENABLE PREDICTIVE OPTIMIZATION.') AS recommended_action,\n    tl.source_table_full_name AS target,\n    CAST(NULL AS STRING) AS query_sample,\n    COUNT(DISTINCT tl.entity_id) AS exec_count,\n    ROUND(SUM(qh.total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    CAST(NULL AS DOUBLE) AS avg_compute_s,\n    ROUND(SUM(qh.spilled_local_bytes) / POW(1024, 3), 2) AS avg_spill_gb,\n    CAST(NULL AS DOUBLE) AS pruning_pct,\n    ROUND(SUM(qh.read_bytes) / POW(1024, 3), 2) AS total_read_gb\n  FROM system.access.table_lineage tl\n  LEFT JOIN heavy_queries qh ON qh.statement_id = tl.entity_id\n  WHERE tl.event_date >= DATE_SUB(CURRENT_DATE(), 30)\n    AND tl.source_type = 'TABLE'\n    AND tl.source_table_full_name IS NOT NULL\n  GROUP BY tl.source_table_full_name\n  HAVING COUNT(DISTINCT tl.entity_id) >= (SELECT hot_table_min_queries FROM waf_config)\n     AND COALESCE(SUM(qh.total_task_duration_ms) / 1000.0, 0)\n         >= (SELECT hot_table_min_compute_s FROM waf_config)\n),\n\nsubsecond_bi_candidates AS (\n  SELECT\n    'SUB_SECOND_BI_ENGINE_CANDIDATE' AS category,\n    'per warehouse: COUNT(*) >= subsecond_min_queries AND p50 < subsecond_max_p50_s AND COUNT(DISTINCT executed_by) >= subsecond_min_distinct_users' AS selection_criteria,\n    CONCAT(COUNT(*), ' queries / ',\n           COUNT(DISTINCT executed_by), ' users / p50 ',\n           ROUND(PERCENTILE_APPROX(total_task_duration_ms / 1000.0, 0.5), 2), 's, p95 ',\n           ROUND(PERCENTILE_APPROX(total_task_duration_ms / 1000.0, 0.95), 2), 's. ',\n           'High-volume BI workload - qualifies for sub-second BI engine evaluation.') AS recommended_action,\n    CONCAT('warehouse: ', COALESCE(wn.warehouse_name, '?'), ' (', aq.warehouse_id, ')') AS target,\n    CAST(NULL AS STRING) AS query_sample,\n    COUNT(*) AS exec_count,\n    ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n    CAST(NULL AS DOUBLE) AS avg_spill_gb,\n    CAST(NULL AS DOUBLE) AS pruning_pct,\n    ROUND(SUM(read_bytes) / POW(1024, 3), 2) AS total_read_gb\n  FROM all_queries aq\n  LEFT JOIN warehouse_names wn USING (warehouse_id)\n  GROUP BY aq.warehouse_id, wn.warehouse_name\n  HAVING COUNT(*) >= (SELECT subsecond_min_queries FROM waf_config)\n     AND PERCENTILE_APPROX(total_task_duration_ms / 1000.0, 0.5)\n         < (SELECT subsecond_max_p50_s FROM waf_config)\n     AND COUNT(DISTINCT executed_by) >= (SELECT subsecond_min_distinct_users FROM waf_config)\n),\n\ncombined AS (\n  SELECT * FROM subsecond_bi_candidates\n  UNION ALL SELECT * FROM top_expensive_queries\n  UNION ALL SELECT * FROM mv_candidates\n  UNION ALL SELECT * FROM low_pruning_queries\n  UNION ALL SELECT * FROM spill_queries\n  UNION ALL SELECT * FROM hot_tables\n)\n\nSELECT\n  category,\n  selection_criteria,\n  recommended_action,\n  COALESCE(target, SUBSTR(query_sample, 1, 80)) AS target_or_sample,\n  target,\n  query_sample,\n  exec_count,\n  total_compute_s,\n  CAST(total_compute_s / 3600.0 AS DOUBLE) AS compute_hours,\n  avg_compute_s,\n  avg_spill_gb,\n  pruning_pct,\n  total_read_gb\nFROM combined\n"
+        "WITH\nwaf_config AS (\n  SELECT\n    -- Values marked with `:` are dashboard parameters \u2014 exposed as input\n    -- widgets on the Filters page. Edit the defaults in PARAM_DECLS below.\n    make_dt_interval(:lookback_days) AS lookback,\n    :min_query_duration_s              AS min_query_duration_s,\n    20    AS top_expensive_queries_n,\n    20    AS mv_min_executions,\n    300.0 AS mv_min_total_compute_s,\n    1.0   AS pruning_min_read_gb,\n    20.0  AS pruning_max_pct,\n    3     AS pruning_min_executions,\n    1.0   AS spill_min_avg_gb,\n    3     AS spill_min_executions,\n    50    AS hot_table_min_queries,\n    100.0 AS hot_table_min_compute_s,\n    5000  AS subsecond_min_queries,\n    5.0   AS subsecond_max_p50_s,\n    3     AS subsecond_min_distinct_users,\n    5.0   AS classic_startup_minutes,\n    :min_classic_dbu_cost_30d AS min_classic_dbu_cost_30d,\n    3     AS min_runs_30d,\n    15.0  AS short_run_threshold_minutes,\n    90.0  AS long_run_threshold_minutes,\n    20    AS high_frequency_runs_30d,\n    25.0  AS high_startup_share_pct,\n    2.0   AS predictable_p95_p50_ratio,\n    5.0   AS unpredictable_p95_p50_ratio,\n    :min_fit_score AS min_fit_score,\n    '^(test-|dev-|scratch-)' AS jobs_exclude_name_pattern,\n    map(\n      '2X_SMALL',  4.0,  'X_SMALL',   6.0,  'SMALL',    12.0,\n      'MEDIUM',   24.0,  'LARGE',    40.0,  'X_LARGE',  80.0,\n      '2X_LARGE',144.0,  '3X_LARGE',272.0,  '4X_LARGE',528.0\n    ) AS dbu_rate,\n    map('CLASSIC', 0.22, 'PRO', 0.55, 'SERVERLESS', 0.70) AS type_rate,\n    25.0  AS migration_min_idle_pct,\n    0.95  AS migration_max_cost_ratio,\n    0.1   AS size_up_min_spill_gb_per_query,\n    5.0   AS size_up_min_avg_queue_s,\n    30.0  AS size_down_max_p50_s,\n    60.0  AS size_down_max_p95_s,\n    5.0   AS size_down_max_avg_queue_s,\n    10    AS size_down_min_queries,\n    10.0  AS queries_per_cluster_target,\n    30    AS max_cluster_ceiling,\n    10    AS auto_stop_threshold_minutes,\n    10    AS auto_stop_target_minutes,\n    5.0   AS decommission_min_cost_30d,\n    0.05  AS cost_multiplier_floor,\n    80.0  AS raise_warn_high_util_pct,\n    30.0  AS raise_warn_modest_util_pct,\n    5.0   AS min_delta_threshold,\n    '^(lakebridge-warehouse-[0-9]+|cleanup-auto-created-warehouse)$'\n          AS warehouse_exclude_name_pattern\n),\n\nwarehouse_names AS (\n  SELECT warehouse_id, warehouse_name\n  FROM system.compute.warehouses\n  QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) = 1\n),\n\nall_queries AS (\n  SELECT\n    statement_id, executed_by,\n    compute.warehouse_id AS warehouse_id,\n    start_time, total_task_duration_ms, read_bytes, client_application\n  FROM system.query.history\n  WHERE start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND statement_type = 'SELECT'\n    AND execution_status = 'FINISHED'\n),\n\nheavy_queries AS (\n  SELECT\n    aq.statement_id, aq.executed_by, aq.warehouse_id, aq.start_time,\n    aq.total_task_duration_ms, aq.read_bytes,\n    h.statement_text AS query_text,\n    h.pruned_files_bytes AS pruned_bytes,\n    h.spilled_local_bytes,\n    md5(REGEXP_REPLACE(\n          REGEXP_REPLACE(\n            REGEXP_REPLACE(LOWER(h.statement_text), \"'[^']*'\", '?'),\n            '\\\\b\\\\d+\\\\b', '?'),\n          '\\\\s+', ' ')) AS query_signature\n  FROM all_queries aq\n  JOIN system.query.history h USING (statement_id)\n  WHERE aq.total_task_duration_ms > (SELECT min_query_duration_s * 1000 FROM waf_config)\n    AND h.statement_text IS NOT NULL\n),\n\ntop_expensive_queries AS (\n  SELECT *\n  FROM (\n    SELECT\n      'EXPENSIVE_QUERY_REVIEW' AS category,\n      'top N query signatures by SUM(total_task_duration_ms)' AS selection_criteria,\n      CONCAT('Top query - ', COUNT(*), ' runs, ',\n             ROUND(SUM(total_task_duration_ms) / 60000.0, 1), ' min total. ',\n             'Open the query profile / review with AI for tuning.') AS recommended_action,\n      CAST(NULL AS STRING) AS target,\n      SUBSTR(MIN(query_text), 1, 300) AS query_sample,\n      COUNT(*) AS exec_count,\n      ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n      ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n      CAST(NULL AS DOUBLE) AS avg_spill_gb,\n      CAST(NULL AS DOUBLE) AS pruning_pct,\n      ROUND(SUM(read_bytes) / POW(1024, 3), 2) AS total_read_gb\n    FROM heavy_queries\n    GROUP BY query_signature\n  )\n  QUALIFY ROW_NUMBER() OVER (ORDER BY total_compute_s DESC)\n    <= (SELECT top_expensive_queries_n FROM waf_config)\n),\n\nmv_candidates AS (\n  SELECT\n    'MATERIALIZED_VIEW_CANDIDATE' AS category,\n    'same query signature: COUNT(*) >= mv_min_executions AND total compute >= mv_min_total_compute_s' AS selection_criteria,\n    CONCAT('Run ', COUNT(*), 'x - total ',\n           ROUND(SUM(total_task_duration_ms) / 60000.0, 1), ' min compute. ',\n           'CREATE MATERIALIZED VIEW.') AS recommended_action,\n    CAST(NULL AS STRING) AS target,\n    SUBSTR(MIN(query_text), 1, 300) AS query_sample,\n    COUNT(*) AS exec_count,\n    ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n    CAST(NULL AS DOUBLE) AS avg_spill_gb,\n    CAST(NULL AS DOUBLE) AS pruning_pct,\n    ROUND(SUM(read_bytes) / POW(1024, 3), 2) AS total_read_gb\n  FROM heavy_queries\n  GROUP BY query_signature\n  HAVING COUNT(*) >= (SELECT mv_min_executions FROM waf_config)\n     AND SUM(total_task_duration_ms) / 1000.0 >= (SELECT mv_min_total_compute_s FROM waf_config)\n),\n\nlow_pruning_queries AS (\n  SELECT\n    'LIQUID_CLUSTERING_CANDIDATE' AS category,\n    'per-query read_bytes >= pruning_min_read_gb AND COUNT(*) >= pruning_min_executions AND aggregate pruning% < pruning_max_pct' AS selection_criteria,\n    CONCAT('Reads ', ROUND(SUM(read_bytes) / POW(1024, 3), 1),\n           ' GB with only ',\n           ROUND(SUM(pruned_bytes) * 100.0\n                 / NULLIF(SUM(read_bytes) + SUM(pruned_bytes), 0), 1),\n           '% pruned over ', COUNT(*), ' runs. ',\n           'ALTER TABLE ... CLUSTER BY (filter columns).') AS recommended_action,\n    CAST(NULL AS STRING) AS target,\n    SUBSTR(MIN(query_text), 1, 300) AS query_sample,\n    COUNT(*) AS exec_count,\n    ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n    CAST(NULL AS DOUBLE) AS avg_spill_gb,\n    ROUND(SUM(pruned_bytes) * 100.0\n          / NULLIF(SUM(read_bytes) + SUM(pruned_bytes), 0), 1) AS pruning_pct,\n    ROUND(SUM(read_bytes) / POW(1024, 3), 2) AS total_read_gb\n  FROM heavy_queries\n  WHERE read_bytes >= (SELECT pruning_min_read_gb FROM waf_config) * POW(1024, 3)\n  GROUP BY query_signature\n  HAVING COUNT(*) >= (SELECT pruning_min_executions FROM waf_config)\n     AND SUM(pruned_bytes) * 100.0\n         / NULLIF(SUM(read_bytes) + SUM(pruned_bytes), 0)\n         < (SELECT pruning_max_pct FROM waf_config)\n),\n\nspill_queries AS (\n  SELECT\n    'HIGH_SPILL_QUERY' AS category,\n    'per-row spilled_local_bytes > 0 AND COUNT(*) >= spill_min_executions AND AVG(spill GB) >= spill_min_avg_gb' AS selection_criteria,\n    CONCAT('Avg ', ROUND(AVG(spilled_local_bytes) / POW(1024, 3), 1),\n           ' GB spill / query over ', COUNT(*), ' runs. ',\n           'Size up warehouse or rewrite (broadcast joins, narrow projections).') AS recommended_action,\n    CAST(NULL AS STRING) AS target,\n    SUBSTR(MIN(query_text), 1, 300) AS query_sample,\n    COUNT(*) AS exec_count,\n    ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n    ROUND(AVG(spilled_local_bytes) / POW(1024, 3), 2) AS avg_spill_gb,\n    CAST(NULL AS DOUBLE) AS pruning_pct,\n    CAST(NULL AS DOUBLE) AS total_read_gb\n  FROM heavy_queries\n  WHERE spilled_local_bytes > 0\n  GROUP BY query_signature\n  HAVING COUNT(*) >= (SELECT spill_min_executions FROM waf_config)\n     AND AVG(spilled_local_bytes) / POW(1024, 3) >= (SELECT spill_min_avg_gb FROM waf_config)\n),\n\nhot_tables AS (\n  SELECT\n    'HOT_TABLE_REVIEW' AS category,\n    'per source_table_full_name: COUNT(DISTINCT entity_id) >= hot_table_min_queries AND total compute >= hot_table_min_compute_s' AS selection_criteria,\n    CONCAT('Read by ', COUNT(DISTINCT tl.entity_id), ' queries / ',\n           COUNT(DISTINCT tl.created_by), ' users. ',\n           'High-leverage target - review LIQUID CLUSTERING + ENABLE PREDICTIVE OPTIMIZATION.') AS recommended_action,\n    tl.source_table_full_name AS target,\n    CAST(NULL AS STRING) AS query_sample,\n    COUNT(DISTINCT tl.entity_id) AS exec_count,\n    ROUND(SUM(qh.total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    CAST(NULL AS DOUBLE) AS avg_compute_s,\n    ROUND(SUM(qh.spilled_local_bytes) / POW(1024, 3), 2) AS avg_spill_gb,\n    CAST(NULL AS DOUBLE) AS pruning_pct,\n    ROUND(SUM(qh.read_bytes) / POW(1024, 3), 2) AS total_read_gb\n  FROM system.access.table_lineage tl\n  LEFT JOIN heavy_queries qh ON qh.statement_id = tl.entity_id\n  WHERE tl.event_date >= DATE_SUB(CURRENT_DATE(), :lookback_days)\n    AND tl.source_type = 'TABLE'\n    AND tl.source_table_full_name IS NOT NULL\n  GROUP BY tl.source_table_full_name\n  HAVING COUNT(DISTINCT tl.entity_id) >= (SELECT hot_table_min_queries FROM waf_config)\n     AND COALESCE(SUM(qh.total_task_duration_ms) / 1000.0, 0)\n         >= (SELECT hot_table_min_compute_s FROM waf_config)\n),\n\nsubsecond_bi_candidates AS (\n  SELECT\n    'SUB_SECOND_BI_ENGINE_CANDIDATE' AS category,\n    'per warehouse: COUNT(*) >= subsecond_min_queries AND p50 < subsecond_max_p50_s AND COUNT(DISTINCT executed_by) >= subsecond_min_distinct_users' AS selection_criteria,\n    CONCAT(COUNT(*), ' queries / ',\n           COUNT(DISTINCT executed_by), ' users / p50 ',\n           ROUND(PERCENTILE_APPROX(total_task_duration_ms / 1000.0, 0.5), 2), 's, p95 ',\n           ROUND(PERCENTILE_APPROX(total_task_duration_ms / 1000.0, 0.95), 2), 's. ',\n           'High-volume BI workload - qualifies for sub-second BI engine evaluation.') AS recommended_action,\n    CONCAT('warehouse: ', COALESCE(wn.warehouse_name, '?'), ' (', aq.warehouse_id, ')') AS target,\n    CAST(NULL AS STRING) AS query_sample,\n    COUNT(*) AS exec_count,\n    ROUND(SUM(total_task_duration_ms) / 1000.0, 1) AS total_compute_s,\n    ROUND(AVG(total_task_duration_ms) / 1000.0, 2) AS avg_compute_s,\n    CAST(NULL AS DOUBLE) AS avg_spill_gb,\n    CAST(NULL AS DOUBLE) AS pruning_pct,\n    ROUND(SUM(read_bytes) / POW(1024, 3), 2) AS total_read_gb\n  FROM all_queries aq\n  LEFT JOIN warehouse_names wn USING (warehouse_id)\n  GROUP BY aq.warehouse_id, wn.warehouse_name\n  HAVING COUNT(*) >= (SELECT subsecond_min_queries FROM waf_config)\n     AND PERCENTILE_APPROX(total_task_duration_ms / 1000.0, 0.5)\n         < (SELECT subsecond_max_p50_s FROM waf_config)\n     AND COUNT(DISTINCT executed_by) >= (SELECT subsecond_min_distinct_users FROM waf_config)\n),\n\ncombined AS (\n  SELECT * FROM subsecond_bi_candidates\n  UNION ALL SELECT * FROM top_expensive_queries\n  UNION ALL SELECT * FROM mv_candidates\n  UNION ALL SELECT * FROM low_pruning_queries\n  UNION ALL SELECT * FROM spill_queries\n  UNION ALL SELECT * FROM hot_tables\n)\n\nSELECT\n  category,\n  selection_criteria,\n  recommended_action,\n  COALESCE(target, SUBSTR(query_sample, 1, 80)) AS target_or_sample,\n  target,\n  query_sample,\n  exec_count,\n  total_compute_s,\n  CAST(total_compute_s / 3600.0 AS DOUBLE) AS compute_hours,\n  avg_compute_s,\n  avg_spill_gb,\n  pruning_pct,\n  total_read_gb\nFROM combined\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Lookback (days)",
+          "keyword": "lookback_days",
+          "dataType": "INTEGER",
+          "defaultSelection": {
+            "values": {
+              "dataType": "INTEGER",
+              "values": [
+                {
+                  "value": "30"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Min query duration (s)",
+          "keyword": "min_query_duration_s",
+          "dataType": "INTEGER",
+          "defaultSelection": {
+            "values": {
+              "dataType": "INTEGER",
+              "values": [
+                {
+                  "value": "5"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Min job fit score",
+          "keyword": "min_fit_score",
+          "dataType": "INTEGER",
+          "defaultSelection": {
+            "values": {
+              "dataType": "INTEGER",
+              "values": [
+                {
+                  "value": "40"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Min job cost 30d ($)",
+          "keyword": "min_classic_dbu_cost_30d",
+          "dataType": "DECIMAL",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DECIMAL",
+              "values": [
+                {
+                  "value": "25.0"
+                }
+              ]
+            }
+          }
+        }
       ]
     },
     {
       "name": "jobs_recos",
       "displayName": "Job -> serverless candidates",
       "queryLines": [
-        "WITH\nwaf_config AS (\n  SELECT\n    INTERVAL 30 DAYS AS lookback,\n    5     AS min_query_duration_s,\n    20    AS top_expensive_queries_n,\n    20    AS mv_min_executions,\n    300.0 AS mv_min_total_compute_s,\n    1.0   AS pruning_min_read_gb,\n    20.0  AS pruning_max_pct,\n    3     AS pruning_min_executions,\n    1.0   AS spill_min_avg_gb,\n    3     AS spill_min_executions,\n    50    AS hot_table_min_queries,\n    100.0 AS hot_table_min_compute_s,\n    5000  AS subsecond_min_queries,\n    5.0   AS subsecond_max_p50_s,\n    3     AS subsecond_min_distinct_users,\n    5.0   AS classic_startup_minutes,\n    25.0  AS min_classic_dbu_cost_30d,\n    3     AS min_runs_30d,\n    15.0  AS short_run_threshold_minutes,\n    90.0  AS long_run_threshold_minutes,\n    20    AS high_frequency_runs_30d,\n    25.0  AS high_startup_share_pct,\n    2.0   AS predictable_p95_p50_ratio,\n    5.0   AS unpredictable_p95_p50_ratio,\n    40    AS min_fit_score,\n    '^(test-|dev-|scratch-)' AS jobs_exclude_name_pattern,\n    map(\n      '2X_SMALL',  4.0,  'X_SMALL',   6.0,  'SMALL',    12.0,\n      'MEDIUM',   24.0,  'LARGE',    40.0,  'X_LARGE',  80.0,\n      '2X_LARGE',144.0,  '3X_LARGE',272.0,  '4X_LARGE',528.0\n    ) AS dbu_rate,\n    map('CLASSIC', 0.22, 'PRO', 0.55, 'SERVERLESS', 0.70) AS type_rate,\n    25.0  AS migration_min_idle_pct,\n    0.95  AS migration_max_cost_ratio,\n    0.1   AS size_up_min_spill_gb_per_query,\n    5.0   AS size_up_min_avg_queue_s,\n    30.0  AS size_down_max_p50_s,\n    60.0  AS size_down_max_p95_s,\n    5.0   AS size_down_max_avg_queue_s,\n    10    AS size_down_min_queries,\n    10.0  AS queries_per_cluster_target,\n    30    AS max_cluster_ceiling,\n    10    AS auto_stop_threshold_minutes,\n    10    AS auto_stop_target_minutes,\n    5.0   AS decommission_min_cost_30d,\n    0.05  AS cost_multiplier_floor,\n    80.0  AS raise_warn_high_util_pct,\n    30.0  AS raise_warn_modest_util_pct,\n    5.0   AS min_delta_threshold,\n    '^(lakebridge-warehouse-[0-9]+|cleanup-auto-created-warehouse)$'\n          AS warehouse_exclude_name_pattern\n),\n\ncurrent_jobs AS (\n  SELECT job_id, workspace_id, name AS job_name, creator_id\n  FROM system.lakeflow.jobs\n  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id\n                             ORDER BY change_time DESC) = 1\n),\n\nrun_stats AS (\n  SELECT\n    workspace_id, job_id,\n    COUNT(DISTINCT run_id) AS run_count_30d,\n    AVG((UNIX_TIMESTAMP(period_end_time) - UNIX_TIMESTAMP(period_start_time)) / 60.0)\n      AS avg_run_minutes,\n    PERCENTILE_APPROX(\n      (UNIX_TIMESTAMP(period_end_time) - UNIX_TIMESTAMP(period_start_time)) / 60.0,\n      0.5)  AS p50_run_minutes,\n    PERCENTILE_APPROX(\n      (UNIX_TIMESTAMP(period_end_time) - UNIX_TIMESTAMP(period_start_time)) / 60.0,\n      0.95) AS p95_run_minutes,\n    100.0 * SUM(\n      CASE WHEN (UNIX_TIMESTAMP(period_end_time) - UNIX_TIMESTAMP(period_start_time)) / 60.0\n                < (SELECT short_run_threshold_minutes FROM waf_config)\n           THEN 1 ELSE 0 END\n    ) / NULLIF(COUNT(*), 0) AS short_run_share_pct,\n    SUM(CASE WHEN result_state = 'FAILED' THEN 1 ELSE 0 END) AS failed_runs,\n    SUM(CASE WHEN termination_code IN (\n      'CLUSTER_ERROR','DRIVER_ERROR','CLUSTER_REQUEST_LIMIT_EXCEEDED',\n      'INSTANCE_UNREACHABLE','UNEXPECTED_LAUNCH_FAILURE'\n    ) THEN 1 ELSE 0 END) AS infra_failure_count,\n    SUM(CASE WHEN termination_code = 'INIT_SCRIPT_FAILURE' THEN 1 ELSE 0 END)\n      AS init_script_failure_count\n  FROM system.lakeflow.job_run_timeline\n  WHERE period_start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND period_end_time IS NOT NULL\n  GROUP BY workspace_id, job_id\n),\n\njob_billing AS (\n  SELECT\n    u.workspace_id,\n    u.usage_metadata.job_id AS job_id,\n    SUM(CASE WHEN u.sku_name ILIKE '%SERVERLESS%' THEN 0\n             ELSE u.usage_quantity END) AS classic_dbus_30d,\n    SUM(CASE WHEN u.sku_name ILIKE '%SERVERLESS%' THEN u.usage_quantity\n             ELSE 0 END)                AS serverless_dbus_30d,\n    SUM(CASE WHEN u.sku_name ILIKE '%SERVERLESS%' THEN 0\n             ELSE u.usage_quantity * p.pricing.effective_list.default END)\n      AS classic_dbu_cost_30d\n  FROM system.billing.usage u\n  LEFT JOIN system.billing.list_prices p\n    ON u.sku_name = p.sku_name AND u.usage_unit = p.usage_unit\n   AND u.usage_end_time BETWEEN p.price_start_time\n                            AND COALESCE(p.price_end_time, NOW() + INTERVAL 1 DAY)\n  WHERE u.billing_origin_product = 'JOBS'\n    AND u.usage_metadata.job_id IS NOT NULL\n    AND u.usage_start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND p.currency_code = 'USD'\n  GROUP BY u.workspace_id, u.usage_metadata.job_id\n),\n\nbase AS (\n  SELECT\n    j.workspace_id, j.job_id, j.job_name, j.creator_id,\n    rs.run_count_30d, rs.avg_run_minutes, rs.p50_run_minutes, rs.p95_run_minutes,\n    rs.short_run_share_pct, rs.failed_runs, rs.infra_failure_count,\n    rs.init_script_failure_count,\n    b.classic_dbus_30d, b.classic_dbu_cost_30d, b.serverless_dbus_30d,\n    LEAST(0.80,\n      (SELECT classic_startup_minutes FROM waf_config) / NULLIF(rs.avg_run_minutes, 0)\n    ) AS startup_share,\n    rs.p95_run_minutes / NULLIF(rs.p50_run_minutes, 0) AS p95_p50_ratio,\n    100.0 * rs.failed_runs / NULLIF(rs.run_count_30d, 0) AS failure_rate_pct,\n    rs.run_count_30d / 30.0 AS runs_per_day\n  FROM current_jobs j\n  JOIN run_stats   rs USING (workspace_id, job_id)\n  JOIN job_billing b  USING (workspace_id, job_id)\n  WHERE b.classic_dbus_30d > 0\n),\n\nscored AS (\n  SELECT b.*,\n    GREATEST(0, LEAST(30,\n      30 * ((SELECT long_run_threshold_minutes FROM waf_config) - avg_run_minutes)\n         / NULLIF((SELECT long_run_threshold_minutes FROM waf_config)\n                  - (SELECT short_run_threshold_minutes FROM waf_config), 0)\n    )) AS score_duration,\n    LEAST(20,\n      20.0 * run_count_30d / (SELECT high_frequency_runs_30d FROM waf_config)\n    ) AS score_frequency,\n    LEAST(20,\n      20.0 * startup_share * 100 / (SELECT high_startup_share_pct FROM waf_config)\n    ) AS score_startup,\n    GREATEST(0, LEAST(10,\n      10 * ((SELECT unpredictable_p95_p50_ratio FROM waf_config) - p95_p50_ratio)\n         / NULLIF((SELECT unpredictable_p95_p50_ratio FROM waf_config)\n                  - (SELECT predictable_p95_p50_ratio FROM waf_config), 0)\n    )) AS score_predictability,\n    CASE WHEN infra_failure_count > 0 THEN 20 ELSE 0 END\n      AS score_infra_failures\n  FROM base b\n),\n\nfinal AS (\n  SELECT\n    workspace_id, job_id, job_name, creator_id,\n    run_count_30d,\n    ROUND(runs_per_day, 1) AS runs_per_day,\n    ROUND(avg_run_minutes, 1) AS avg_run_minutes,\n    ROUND(p50_run_minutes, 1) AS p50_run_minutes,\n    ROUND(p95_run_minutes, 1) AS p95_run_minutes,\n    ROUND(p95_p50_ratio, 2)   AS p95_p50_ratio,\n    ROUND(short_run_share_pct, 1) AS short_run_share_pct,\n    ROUND(100.0 * startup_share, 1) AS startup_share_pct,\n    ROUND(failure_rate_pct, 1) AS failure_rate_pct,\n    infra_failure_count,\n    init_script_failure_count,\n    ROUND(classic_dbus_30d, 1)      AS classic_dbus_30d,\n    CAST(ROUND(classic_dbu_cost_30d, 2) AS DOUBLE)  AS classic_dbu_cost_30d,\n    ROUND(serverless_dbus_30d, 1)   AS serverless_dbus_30d,\n    CAST(ROUND(score_duration + score_frequency + score_startup\n        + score_predictability + score_infra_failures, 0) AS INT) AS fit_score,\n    ROUND(score_duration, 0)       AS pts_duration,\n    ROUND(score_frequency, 0)      AS pts_frequency,\n    ROUND(score_startup, 0)        AS pts_startup,\n    ROUND(score_predictability, 0) AS pts_predictability,\n    ROUND(score_infra_failures, 0) AS pts_infra_failures,\n    NULLIF(CONCAT_WS('; ',\n      CASE WHEN avg_run_minutes <= (SELECT short_run_threshold_minutes FROM waf_config)\n           THEN CONCAT('short avg run (', ROUND(avg_run_minutes, 1), ' min)') END,\n      CASE WHEN run_count_30d >= (SELECT high_frequency_runs_30d FROM waf_config)\n           THEN CONCAT('frequent (', run_count_30d, ' runs/30d)') END,\n      CASE WHEN startup_share * 100 >= (SELECT high_startup_share_pct FROM waf_config)\n           THEN CONCAT('startup is ', ROUND(startup_share * 100, 0),\n                       '% of wall-clock') END,\n      CASE WHEN p95_p50_ratio <= (SELECT predictable_p95_p50_ratio FROM waf_config)\n           THEN 'consistent runtime (low p95/p50 spread)' END,\n      CASE WHEN infra_failure_count > 0\n           THEN CONCAT(infra_failure_count,\n                       ' infra-flavored failure(s) serverless typically avoids') END\n    ), '') AS top_reasons,\n    CASE\n      WHEN init_script_failure_count > 0\n        THEN 'LIKELY BLOCKER: job uses init scripts (init script failures observed). Verify init script content can be replaced by serverless equivalents.'\n      ELSE 'Verify before migrating: (1) no init scripts / custom Docker, (2) no DBFS mounts the workload depends on, (3) supported Spark version, (4) no R, no GPU, (5) network access to required private endpoints.'\n    END AS migration_checklist\n  FROM scored\n  WHERE classic_dbu_cost_30d >= (SELECT min_classic_dbu_cost_30d FROM waf_config)\n    AND run_count_30d        >= (SELECT min_runs_30d FROM waf_config)\n)\n\nSELECT\n  job_id, job_name, workspace_id, creator_id,\n  fit_score,\n  CASE\n    WHEN fit_score >= 80 THEN '80-100 (Strong)'\n    WHEN fit_score >= 60 THEN '60-79 (Good)'\n    WHEN fit_score >= 40 THEN '40-59 (Marginal)'\n    ELSE '< 40 (Skip)'\n  END AS fit_bucket,\n  run_count_30d, runs_per_day,\n  avg_run_minutes, p50_run_minutes, p95_run_minutes, p95_p50_ratio,\n  short_run_share_pct, startup_share_pct, failure_rate_pct,\n  infra_failure_count, init_script_failure_count,\n  classic_dbus_30d, classic_dbu_cost_30d, serverless_dbus_30d,\n  pts_duration, pts_frequency, pts_startup, pts_predictability, pts_infra_failures,\n  top_reasons, migration_checklist,\n  CASE WHEN init_script_failure_count > 0 THEN 'BLOCKER' ELSE 'OK' END AS migration_risk\nFROM final\nWHERE fit_score >= (SELECT min_fit_score FROM waf_config)\n  AND job_name NOT RLIKE (SELECT jobs_exclude_name_pattern FROM waf_config)\n"
+        "WITH\nwaf_config AS (\n  SELECT\n    -- Values marked with `:` are dashboard parameters \u2014 exposed as input\n    -- widgets on the Filters page. Edit the defaults in PARAM_DECLS below.\n    make_dt_interval(:lookback_days) AS lookback,\n    :min_query_duration_s              AS min_query_duration_s,\n    20    AS top_expensive_queries_n,\n    20    AS mv_min_executions,\n    300.0 AS mv_min_total_compute_s,\n    1.0   AS pruning_min_read_gb,\n    20.0  AS pruning_max_pct,\n    3     AS pruning_min_executions,\n    1.0   AS spill_min_avg_gb,\n    3     AS spill_min_executions,\n    50    AS hot_table_min_queries,\n    100.0 AS hot_table_min_compute_s,\n    5000  AS subsecond_min_queries,\n    5.0   AS subsecond_max_p50_s,\n    3     AS subsecond_min_distinct_users,\n    5.0   AS classic_startup_minutes,\n    :min_classic_dbu_cost_30d AS min_classic_dbu_cost_30d,\n    3     AS min_runs_30d,\n    15.0  AS short_run_threshold_minutes,\n    90.0  AS long_run_threshold_minutes,\n    20    AS high_frequency_runs_30d,\n    25.0  AS high_startup_share_pct,\n    2.0   AS predictable_p95_p50_ratio,\n    5.0   AS unpredictable_p95_p50_ratio,\n    :min_fit_score AS min_fit_score,\n    '^(test-|dev-|scratch-)' AS jobs_exclude_name_pattern,\n    map(\n      '2X_SMALL',  4.0,  'X_SMALL',   6.0,  'SMALL',    12.0,\n      'MEDIUM',   24.0,  'LARGE',    40.0,  'X_LARGE',  80.0,\n      '2X_LARGE',144.0,  '3X_LARGE',272.0,  '4X_LARGE',528.0\n    ) AS dbu_rate,\n    map('CLASSIC', 0.22, 'PRO', 0.55, 'SERVERLESS', 0.70) AS type_rate,\n    25.0  AS migration_min_idle_pct,\n    0.95  AS migration_max_cost_ratio,\n    0.1   AS size_up_min_spill_gb_per_query,\n    5.0   AS size_up_min_avg_queue_s,\n    30.0  AS size_down_max_p50_s,\n    60.0  AS size_down_max_p95_s,\n    5.0   AS size_down_max_avg_queue_s,\n    10    AS size_down_min_queries,\n    10.0  AS queries_per_cluster_target,\n    30    AS max_cluster_ceiling,\n    10    AS auto_stop_threshold_minutes,\n    10    AS auto_stop_target_minutes,\n    5.0   AS decommission_min_cost_30d,\n    0.05  AS cost_multiplier_floor,\n    80.0  AS raise_warn_high_util_pct,\n    30.0  AS raise_warn_modest_util_pct,\n    5.0   AS min_delta_threshold,\n    '^(lakebridge-warehouse-[0-9]+|cleanup-auto-created-warehouse)$'\n          AS warehouse_exclude_name_pattern\n),\n\ncurrent_jobs AS (\n  SELECT job_id, workspace_id, name AS job_name, creator_id\n  FROM system.lakeflow.jobs\n  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id\n                             ORDER BY change_time DESC) = 1\n),\n\nrun_stats AS (\n  SELECT\n    workspace_id, job_id,\n    COUNT(DISTINCT run_id) AS run_count_30d,\n    AVG((UNIX_TIMESTAMP(period_end_time) - UNIX_TIMESTAMP(period_start_time)) / 60.0)\n      AS avg_run_minutes,\n    PERCENTILE_APPROX(\n      (UNIX_TIMESTAMP(period_end_time) - UNIX_TIMESTAMP(period_start_time)) / 60.0,\n      0.5)  AS p50_run_minutes,\n    PERCENTILE_APPROX(\n      (UNIX_TIMESTAMP(period_end_time) - UNIX_TIMESTAMP(period_start_time)) / 60.0,\n      0.95) AS p95_run_minutes,\n    100.0 * SUM(\n      CASE WHEN (UNIX_TIMESTAMP(period_end_time) - UNIX_TIMESTAMP(period_start_time)) / 60.0\n                < (SELECT short_run_threshold_minutes FROM waf_config)\n           THEN 1 ELSE 0 END\n    ) / NULLIF(COUNT(*), 0) AS short_run_share_pct,\n    SUM(CASE WHEN result_state = 'FAILED' THEN 1 ELSE 0 END) AS failed_runs,\n    SUM(CASE WHEN termination_code IN (\n      'CLUSTER_ERROR','DRIVER_ERROR','CLUSTER_REQUEST_LIMIT_EXCEEDED',\n      'INSTANCE_UNREACHABLE','UNEXPECTED_LAUNCH_FAILURE'\n    ) THEN 1 ELSE 0 END) AS infra_failure_count,\n    SUM(CASE WHEN termination_code = 'INIT_SCRIPT_FAILURE' THEN 1 ELSE 0 END)\n      AS init_script_failure_count\n  FROM system.lakeflow.job_run_timeline\n  WHERE period_start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND period_end_time IS NOT NULL\n  GROUP BY workspace_id, job_id\n),\n\njob_billing AS (\n  SELECT\n    u.workspace_id,\n    u.usage_metadata.job_id AS job_id,\n    SUM(CASE WHEN u.sku_name ILIKE '%SERVERLESS%' THEN 0\n             ELSE u.usage_quantity END) AS classic_dbus_30d,\n    SUM(CASE WHEN u.sku_name ILIKE '%SERVERLESS%' THEN u.usage_quantity\n             ELSE 0 END)                AS serverless_dbus_30d,\n    SUM(CASE WHEN u.sku_name ILIKE '%SERVERLESS%' THEN 0\n             ELSE u.usage_quantity * p.pricing.effective_list.default END)\n      AS classic_dbu_cost_30d\n  FROM system.billing.usage u\n  LEFT JOIN system.billing.list_prices p\n    ON u.sku_name = p.sku_name AND u.usage_unit = p.usage_unit\n   AND u.usage_end_time BETWEEN p.price_start_time\n                            AND COALESCE(p.price_end_time, NOW() + INTERVAL 1 DAY)\n  WHERE u.billing_origin_product = 'JOBS'\n    AND u.usage_metadata.job_id IS NOT NULL\n    AND u.usage_start_time >= NOW() - (SELECT lookback FROM waf_config)\n    AND p.currency_code = 'USD'\n  GROUP BY u.workspace_id, u.usage_metadata.job_id\n),\n\nbase AS (\n  SELECT\n    j.workspace_id, j.job_id, j.job_name, j.creator_id,\n    rs.run_count_30d, rs.avg_run_minutes, rs.p50_run_minutes, rs.p95_run_minutes,\n    rs.short_run_share_pct, rs.failed_runs, rs.infra_failure_count,\n    rs.init_script_failure_count,\n    b.classic_dbus_30d, b.classic_dbu_cost_30d, b.serverless_dbus_30d,\n    LEAST(0.80,\n      (SELECT classic_startup_minutes FROM waf_config) / NULLIF(rs.avg_run_minutes, 0)\n    ) AS startup_share,\n    rs.p95_run_minutes / NULLIF(rs.p50_run_minutes, 0) AS p95_p50_ratio,\n    100.0 * rs.failed_runs / NULLIF(rs.run_count_30d, 0) AS failure_rate_pct,\n    rs.run_count_30d / 30.0 AS runs_per_day\n  FROM current_jobs j\n  JOIN run_stats   rs USING (workspace_id, job_id)\n  JOIN job_billing b  USING (workspace_id, job_id)\n  WHERE b.classic_dbus_30d > 0\n),\n\nscored AS (\n  SELECT b.*,\n    GREATEST(0, LEAST(30,\n      30 * ((SELECT long_run_threshold_minutes FROM waf_config) - avg_run_minutes)\n         / NULLIF((SELECT long_run_threshold_minutes FROM waf_config)\n                  - (SELECT short_run_threshold_minutes FROM waf_config), 0)\n    )) AS score_duration,\n    LEAST(20,\n      20.0 * run_count_30d / (SELECT high_frequency_runs_30d FROM waf_config)\n    ) AS score_frequency,\n    LEAST(20,\n      20.0 * startup_share * 100 / (SELECT high_startup_share_pct FROM waf_config)\n    ) AS score_startup,\n    GREATEST(0, LEAST(10,\n      10 * ((SELECT unpredictable_p95_p50_ratio FROM waf_config) - p95_p50_ratio)\n         / NULLIF((SELECT unpredictable_p95_p50_ratio FROM waf_config)\n                  - (SELECT predictable_p95_p50_ratio FROM waf_config), 0)\n    )) AS score_predictability,\n    CASE WHEN infra_failure_count > 0 THEN 20 ELSE 0 END\n      AS score_infra_failures\n  FROM base b\n),\n\nfinal AS (\n  SELECT\n    workspace_id, job_id, job_name, creator_id,\n    run_count_30d,\n    ROUND(runs_per_day, 1) AS runs_per_day,\n    ROUND(avg_run_minutes, 1) AS avg_run_minutes,\n    ROUND(p50_run_minutes, 1) AS p50_run_minutes,\n    ROUND(p95_run_minutes, 1) AS p95_run_minutes,\n    ROUND(p95_p50_ratio, 2)   AS p95_p50_ratio,\n    ROUND(short_run_share_pct, 1) AS short_run_share_pct,\n    ROUND(100.0 * startup_share, 1) AS startup_share_pct,\n    ROUND(failure_rate_pct, 1) AS failure_rate_pct,\n    infra_failure_count,\n    init_script_failure_count,\n    ROUND(classic_dbus_30d, 1)      AS classic_dbus_30d,\n    CAST(ROUND(classic_dbu_cost_30d, 2) AS DOUBLE)  AS classic_dbu_cost_30d,\n    ROUND(serverless_dbus_30d, 1)   AS serverless_dbus_30d,\n    CAST(ROUND(score_duration + score_frequency + score_startup\n        + score_predictability + score_infra_failures, 0) AS INT) AS fit_score,\n    ROUND(score_duration, 0)       AS pts_duration,\n    ROUND(score_frequency, 0)      AS pts_frequency,\n    ROUND(score_startup, 0)        AS pts_startup,\n    ROUND(score_predictability, 0) AS pts_predictability,\n    ROUND(score_infra_failures, 0) AS pts_infra_failures,\n    NULLIF(CONCAT_WS('; ',\n      CASE WHEN avg_run_minutes <= (SELECT short_run_threshold_minutes FROM waf_config)\n           THEN CONCAT('short avg run (', ROUND(avg_run_minutes, 1), ' min)') END,\n      CASE WHEN run_count_30d >= (SELECT high_frequency_runs_30d FROM waf_config)\n           THEN CONCAT('frequent (', run_count_30d, ' runs/30d)') END,\n      CASE WHEN startup_share * 100 >= (SELECT high_startup_share_pct FROM waf_config)\n           THEN CONCAT('startup is ', ROUND(startup_share * 100, 0),\n                       '% of wall-clock') END,\n      CASE WHEN p95_p50_ratio <= (SELECT predictable_p95_p50_ratio FROM waf_config)\n           THEN 'consistent runtime (low p95/p50 spread)' END,\n      CASE WHEN infra_failure_count > 0\n           THEN CONCAT(infra_failure_count,\n                       ' infra-flavored failure(s) serverless typically avoids') END\n    ), '') AS top_reasons,\n    CASE\n      WHEN init_script_failure_count > 0\n        THEN 'LIKELY BLOCKER: job uses init scripts (init script failures observed). Verify init script content can be replaced by serverless equivalents.'\n      ELSE 'Verify before migrating: (1) no init scripts / custom Docker, (2) no DBFS mounts the workload depends on, (3) supported Spark version, (4) no R, no GPU, (5) network access to required private endpoints.'\n    END AS migration_checklist\n  FROM scored\n  WHERE classic_dbu_cost_30d >= (SELECT min_classic_dbu_cost_30d FROM waf_config)\n    AND run_count_30d        >= (SELECT min_runs_30d FROM waf_config)\n)\n\nSELECT\n  job_id, job_name, workspace_id, creator_id,\n  fit_score,\n  CASE\n    WHEN fit_score >= 80 THEN '80-100 (Strong)'\n    WHEN fit_score >= 60 THEN '60-79 (Good)'\n    WHEN fit_score >= 40 THEN '40-59 (Marginal)'\n    ELSE '< 40 (Skip)'\n  END AS fit_bucket,\n  run_count_30d, runs_per_day,\n  avg_run_minutes, p50_run_minutes, p95_run_minutes, p95_p50_ratio,\n  short_run_share_pct, startup_share_pct, failure_rate_pct,\n  infra_failure_count, init_script_failure_count,\n  classic_dbus_30d, classic_dbu_cost_30d, serverless_dbus_30d,\n  pts_duration, pts_frequency, pts_startup, pts_predictability, pts_infra_failures,\n  top_reasons, migration_checklist,\n  CASE WHEN init_script_failure_count > 0 THEN 'BLOCKER' ELSE 'OK' END AS migration_risk\nFROM final\nWHERE fit_score >= (SELECT min_fit_score FROM waf_config)\n  AND job_name NOT RLIKE (SELECT jobs_exclude_name_pattern FROM waf_config)\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Lookback (days)",
+          "keyword": "lookback_days",
+          "dataType": "INTEGER",
+          "defaultSelection": {
+            "values": {
+              "dataType": "INTEGER",
+              "values": [
+                {
+                  "value": "30"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Min query duration (s)",
+          "keyword": "min_query_duration_s",
+          "dataType": "INTEGER",
+          "defaultSelection": {
+            "values": {
+              "dataType": "INTEGER",
+              "values": [
+                {
+                  "value": "5"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Min job fit score",
+          "keyword": "min_fit_score",
+          "dataType": "INTEGER",
+          "defaultSelection": {
+            "values": {
+              "dataType": "INTEGER",
+              "values": [
+                {
+                  "value": "40"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Min job cost 30d ($)",
+          "keyword": "min_classic_dbu_cost_30d",
+          "dataType": "DECIMAL",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DECIMAL",
+              "values": [
+                {
+                  "value": "25.0"
+                }
+              ]
+            }
+          }
+        }
       ]
     }
   ],
@@ -1869,6 +2055,387 @@
             "y": 17,
             "width": 6,
             "height": 10
+          }
+        }
+      ]
+    },
+    {
+      "name": "filters",
+      "displayName": "Filters",
+      "pageType": "PAGE_TYPE_GLOBAL_FILTERS",
+      "layout": [
+        {
+          "widget": {
+            "name": "p-lookback",
+            "queries": [
+              {
+                "name": "q_lookback_days_warehouse_recos",
+                "query": {
+                  "datasetName": "warehouse_recos",
+                  "parameters": [
+                    {
+                      "name": "lookback_days",
+                      "keyword": "lookback_days"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "q_lookback_days_query_table_recos",
+                "query": {
+                  "datasetName": "query_table_recos",
+                  "parameters": [
+                    {
+                      "name": "lookback_days",
+                      "keyword": "lookback_days"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "q_lookback_days_jobs_recos",
+                "query": {
+                  "datasetName": "jobs_recos",
+                  "parameters": [
+                    {
+                      "name": "lookback_days",
+                      "keyword": "lookback_days"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "parameterName": "lookback_days",
+                    "queryName": "q_lookback_days_warehouse_recos"
+                  },
+                  {
+                    "parameterName": "lookback_days",
+                    "queryName": "q_lookback_days_query_table_recos"
+                  },
+                  {
+                    "parameterName": "lookback_days",
+                    "queryName": "q_lookback_days_jobs_recos"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Lookback (days)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "p-min-qdur",
+            "queries": [
+              {
+                "name": "q_min_query_duration_s_query_table_recos",
+                "query": {
+                  "datasetName": "query_table_recos",
+                  "parameters": [
+                    {
+                      "name": "min_query_duration_s",
+                      "keyword": "min_query_duration_s"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "parameterName": "min_query_duration_s",
+                    "queryName": "q_min_query_duration_s_query_table_recos"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Min query duration (s)"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 0,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "p-min-fit",
+            "queries": [
+              {
+                "name": "q_min_fit_score_jobs_recos",
+                "query": {
+                  "datasetName": "jobs_recos",
+                  "parameters": [
+                    {
+                      "name": "min_fit_score",
+                      "keyword": "min_fit_score"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "parameterName": "min_fit_score",
+                    "queryName": "q_min_fit_score_jobs_recos"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Min job fit score"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 0,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "p-min-jobcost",
+            "queries": [
+              {
+                "name": "q_min_classic_dbu_cost_30d_jobs_recos",
+                "query": {
+                  "datasetName": "jobs_recos",
+                  "parameters": [
+                    {
+                      "name": "min_classic_dbu_cost_30d",
+                      "keyword": "min_classic_dbu_cost_30d"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "parameterName": "min_classic_dbu_cost_30d",
+                    "queryName": "q_min_classic_dbu_cost_30d_jobs_recos"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Min job cost 30d ($)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "f-wh-cat",
+            "queries": [
+              {
+                "name": "q_f-wh-cat",
+                "query": {
+                  "datasetName": "warehouse_recos",
+                  "fields": [
+                    {
+                      "name": "category",
+                      "expression": "`category`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "category",
+                    "displayName": "Warehouse category",
+                    "queryName": "q_f-wh-cat"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Warehouse category"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "f-qt-cat",
+            "queries": [
+              {
+                "name": "q_f-qt-cat",
+                "query": {
+                  "datasetName": "query_table_recos",
+                  "fields": [
+                    {
+                      "name": "category",
+                      "expression": "`category`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "category",
+                    "displayName": "Query/table category",
+                    "queryName": "q_f-qt-cat"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Query/table category"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "f-jb-bucket",
+            "queries": [
+              {
+                "name": "q_f-jb-bucket",
+                "query": {
+                  "datasetName": "jobs_recos",
+                  "fields": [
+                    {
+                      "name": "fit_bucket",
+                      "expression": "`fit_bucket`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "fit_bucket",
+                    "displayName": "Job fit bucket",
+                    "queryName": "q_f-jb-bucket"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Job fit bucket"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "f-jb-risk",
+            "queries": [
+              {
+                "name": "q_f-jb-risk",
+                "query": {
+                  "datasetName": "jobs_recos",
+                  "fields": [
+                    {
+                      "name": "migration_risk",
+                      "expression": "`migration_risk`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "migration_risk",
+                    "displayName": "Job migration risk",
+                    "queryName": "q_f-jb-risk"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Job migration risk"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 4,
+            "width": 3,
+            "height": 2
           }
         }
       ]

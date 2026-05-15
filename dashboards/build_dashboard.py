@@ -23,8 +23,10 @@ OUT = os.path.join(os.path.dirname(__file__), "waf_recommendations.lvdash.json")
 # ─────────────────────────────────────────────────────────────────────────────
 WAF_CONFIG_CTE = """waf_config AS (
   SELECT
-    INTERVAL 30 DAYS AS lookback,
-    5     AS min_query_duration_s,
+    -- Values marked with `:` are dashboard parameters — exposed as input
+    -- widgets on the Filters page. Edit the defaults in PARAM_DECLS below.
+    make_dt_interval(:lookback_days) AS lookback,
+    :min_query_duration_s              AS min_query_duration_s,
     20    AS top_expensive_queries_n,
     20    AS mv_min_executions,
     300.0 AS mv_min_total_compute_s,
@@ -39,7 +41,7 @@ WAF_CONFIG_CTE = """waf_config AS (
     5.0   AS subsecond_max_p50_s,
     3     AS subsecond_min_distinct_users,
     5.0   AS classic_startup_minutes,
-    25.0  AS min_classic_dbu_cost_30d,
+    :min_classic_dbu_cost_30d AS min_classic_dbu_cost_30d,
     3     AS min_runs_30d,
     15.0  AS short_run_threshold_minutes,
     90.0  AS long_run_threshold_minutes,
@@ -47,7 +49,7 @@ WAF_CONFIG_CTE = """waf_config AS (
     25.0  AS high_startup_share_pct,
     2.0   AS predictable_p95_p50_ratio,
     5.0   AS unpredictable_p95_p50_ratio,
-    40    AS min_fit_score,
+    :min_fit_score AS min_fit_score,
     '^(test-|dev-|scratch-)' AS jobs_exclude_name_pattern,
     map(
       '2X_SMALL',  4.0,  'X_SMALL',   6.0,  'SMALL',    12.0,
@@ -524,7 +526,7 @@ hot_tables AS (
     ROUND(SUM(qh.read_bytes) / POW(1024, 3), 2) AS total_read_gb
   FROM system.access.table_lineage tl
   LEFT JOIN heavy_queries qh ON qh.statement_id = tl.entity_id
-  WHERE tl.event_date >= DATE_SUB(CURRENT_DATE(), 30)
+  WHERE tl.event_date >= DATE_SUB(CURRENT_DATE(), :lookback_days)
     AND tl.source_type = 'TABLE'
     AND tl.source_table_full_name IS NOT NULL
   GROUP BY tl.source_table_full_name
@@ -763,6 +765,36 @@ WHERE fit_score >= (SELECT min_fit_score FROM waf_config)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Dashboard parameters — declared on every dataset that uses them (all three
+# share WAF_CONFIG_CTE, so each dataset references all four). Defaults match
+# queries/config.sql; viewers can override them via the Filters page widgets.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _param(display, keyword, dtype, default):
+    return {
+        "displayName": display,
+        "keyword": keyword,
+        "dataType": dtype,
+        "defaultSelection": {
+            "values": {
+                "dataType": dtype,
+                "values": [{"value": str(default)}],
+            },
+        },
+    }
+
+
+PARAM_DECLS = [
+    _param("Lookback (days)",          "lookback_days",            "INTEGER", 30),
+    _param("Min query duration (s)",   "min_query_duration_s",     "INTEGER", 5),
+    _param("Min job fit score",        "min_fit_score",            "INTEGER", 40),
+    _param("Min job cost 30d ($)",     "min_classic_dbu_cost_30d", "DECIMAL", "25.0"),
+]
+
+ALL_DATASETS = ["warehouse_recos", "query_table_recos", "jobs_recos"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Widget builders — keep widget-level boilerplate compact.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -856,6 +888,69 @@ def table(name, title, dataset, columns, x, y, w=6, h=8):
                 "version": 2,
                 "widgetType": "table",
                 "encodings": {"columns": encoding_cols},
+                "frame": {"showTitle": True, "title": title},
+            },
+        },
+        "position": {"x": x, "y": y, "width": w, "height": h},
+    }
+
+
+def param_widget(name, title, keyword, datasets, x, y, w=2, h=2):
+    """Threshold-input widget that drives a dataset parameter across one or
+    more datasets. Each dataset's parameter is bound via its own sub-query;
+    changing the widget propagates to all bound datasets simultaneously."""
+    queries, fields = [], []
+    for ds in datasets:
+        qname = f"q_{keyword}_{ds}"
+        queries.append({
+            "name": qname,
+            "query": {
+                "datasetName": ds,
+                "parameters": [{"name": keyword, "keyword": keyword}],
+                "disaggregated": False,
+            },
+        })
+        fields.append({"parameterName": keyword, "queryName": qname})
+    return {
+        "widget": {
+            "name": name,
+            "queries": queries,
+            "spec": {
+                "version": 2,
+                "widgetType": "filter-single-select",
+                "encodings": {"fields": fields},
+                "frame": {"showTitle": True, "title": title},
+            },
+        },
+        "position": {"x": x, "y": y, "width": w, "height": h},
+    }
+
+
+def column_filter(name, title, dataset, field, x, y, w=2, h=2):
+    """Categorical multi-select filter bound to an actual column on a dataset.
+    Affects every widget on every page that reads from `dataset`."""
+    qname = f"q_{name}"
+    return {
+        "widget": {
+            "name": name,
+            "queries": [{
+                "name": qname,
+                "query": {
+                    "datasetName": dataset,
+                    "fields": [{"name": field, "expression": f"`{field}`"}],
+                    "disaggregated": False,
+                },
+            }],
+            "spec": {
+                "version": 2,
+                "widgetType": "filter-multi-select",
+                "encodings": {
+                    "fields": [{
+                        "fieldName": field,
+                        "displayName": title,
+                        "queryName": qname,
+                    }],
+                },
                 "frame": {"showTitle": True, "title": title},
             },
         },
@@ -1077,6 +1172,34 @@ jobs_page = {
 # Assemble + write
 # ─────────────────────────────────────────────────────────────────────────────
 
+filters_page = {
+    "name": "filters",
+    "displayName": "Filters",
+    "pageType": "PAGE_TYPE_GLOBAL_FILTERS",
+    "layout": [
+        # Row 0: numeric threshold inputs (drive dataset parameters).
+        param_widget("p-lookback",     "Lookback (days)",        "lookback_days",
+                     ALL_DATASETS,            x=0, y=0),
+        param_widget("p-min-qdur",     "Min query duration (s)", "min_query_duration_s",
+                     ["query_table_recos"],   x=2, y=0),
+        param_widget("p-min-fit",      "Min job fit score",      "min_fit_score",
+                     ["jobs_recos"],          x=4, y=0),
+        param_widget("p-min-jobcost",  "Min job cost 30d ($)",   "min_classic_dbu_cost_30d",
+                     ["jobs_recos"],          x=0, y=2),
+
+        # Row 2: categorical filters bound to dataset columns.
+        column_filter("f-wh-cat",  "Warehouse category",   "warehouse_recos",   "category",
+                      x=2, y=2),
+        column_filter("f-qt-cat",  "Query/table category", "query_table_recos", "category",
+                      x=4, y=2),
+        column_filter("f-jb-bucket", "Job fit bucket",     "jobs_recos",        "fit_bucket",
+                      x=0, y=4, w=3),
+        column_filter("f-jb-risk",   "Job migration risk", "jobs_recos",        "migration_risk",
+                      x=3, y=4, w=3),
+    ],
+}
+
+
 def build_dashboard_dict() -> dict:
     """Return the dashboard as a Python dict, ready to serialize for the API."""
     return {
@@ -1085,19 +1208,22 @@ def build_dashboard_dict() -> dict:
                 "name": "warehouse_recos",
                 "displayName": "Warehouse recommendations",
                 "queryLines": [WAREHOUSE_SQL],
+                "parameters": PARAM_DECLS,
             },
             {
                 "name": "query_table_recos",
                 "displayName": "Query / table recommendations",
                 "queryLines": [QUERY_TABLE_SQL],
+                "parameters": PARAM_DECLS,
             },
             {
                 "name": "jobs_recos",
                 "displayName": "Job -> serverless candidates",
                 "queryLines": [JOBS_SQL],
+                "parameters": PARAM_DECLS,
             },
         ],
-        "pages": [overview_page, warehouse_page, query_table_page, jobs_page],
+        "pages": [overview_page, warehouse_page, query_table_page, jobs_page, filters_page],
     }
 
 

@@ -3,6 +3,8 @@ venv/
 .claude/
 .vibe-demo.yaml
 .DS_Store
+__pycache__/
+*.pyc
 
 # Local bundle config — copied from databricks.example.yml and edited with
 # the user's workspace host + warehouse id. Not committed.

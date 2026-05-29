@@ -325,6 +325,111 @@ displayHTML(
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### 3.5 AI executive summary
+# MAGIC Feeds the three outputs to an LLM (`databricks-claude-sonnet-4` via the
+# MAGIC Foundation Model API) for a synthesized executive summary + ranked
+# MAGIC priority actions, rendered as HTML. Set `ENABLE_AI_SUMMARY = False` to skip
+# MAGIC the LLM round-trip entirely (mirrors the `enable_ai_reason` toggle in
+# MAGIC `config.sql`). Only the selected queries' results are included.
+
+# COMMAND ----------
+
+# Toggle + model. Set ENABLE_AI_SUMMARY = False to skip the LLM call (no cost).
+ENABLE_AI_SUMMARY = True
+AI_SUMMARY_MODEL = "databricks-claude-sonnet-4"
+
+
+def _df_to_markdown(df, n=10):
+    """Top-N rows as a markdown table for the LLM prompt. `to_markdown` needs
+    `tabulate`; fall back to `to_string` if it isn't on the image."""
+    if not _nonempty(df):
+        return "_(not selected / no rows)_"
+    head = df.head(n)
+    try:
+        return head.to_markdown(index=False)
+    except Exception:
+        return head.to_string(index=False)
+
+
+def call_llm(system_prompt, user_prompt, max_tokens=1200):
+    """Call the Databricks Foundation Model API and return the response text."""
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+    w = WorkspaceClient()
+    resp = w.serving_endpoints.query(
+        name=AI_SUMMARY_MODEL,
+        messages=[
+            ChatMessage(role=ChatMessageRole.SYSTEM, content=system_prompt),
+            ChatMessage(role=ChatMessageRole.USER, content=user_prompt),
+        ],
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content
+
+
+if not ENABLE_AI_SUMMARY:
+    print("AI summary disabled (ENABLE_AI_SUMMARY=False).")
+elif not any(_nonempty(x) for x in (wh, qt, jb)):
+    print("No results selected — AI summary skipped.")
+else:
+    _system = (
+        "You are a Databricks cost/performance optimization advisor. Using ONLY "
+        "the data provided, produce a one-paragraph Executive Summary of the total "
+        "opportunity, then a numbered list of 3-5 Priority Actions spanning "
+        "warehouses, queries/tables, and jobs. Respond in clean HTML using only "
+        "<h3>, <p>, <ol>, <li>, <strong>, <em> tags (no <script>, no inline CSS). "
+        "Do not invent numbers; cite the figures given."
+    )
+    _kpis = (
+        f"- Identified warehouse savings (30d): ${wh_savings_30d:,.0f}\n"
+        f"- Annualized projection: ${annualized:,.0f}\n"
+        f"- Warehouses flagged: {wh_count} "
+        f"(${wh_current_spend_30d:,.0f} current 30d spend)\n"
+        f"- Query/table optimizations: {qt_count} "
+        f"({qt_compute_hours:,.0f} compute hours flagged)\n"
+        f"- Jobs -> serverless: {jb_count} "
+        f"({jb_high_fit} at >=70 fit, ${jb_addressable_spend:,.0f} addressable)"
+    )
+    _sections = []
+    if _nonempty(wh):
+        _sections.append(
+            "## Warehouse recommendations\n"
+            + _df_to_markdown(wh.sort_values("effective_savings_30d", ascending=False))
+        )
+    if _nonempty(qt):
+        _sections.append(
+            "## Query/table optimizations\n"
+            + _df_to_markdown(qt.sort_values("total_compute_s", ascending=False))
+        )
+    if _nonempty(jb):
+        _sections.append(
+            "## Jobs -> serverless\n"
+            + _df_to_markdown(jb.sort_values("fit_score", ascending=False))
+        )
+    _user = "Headline KPIs:\n" + _kpis + "\n\n" + "\n\n".join(_sections)
+
+    try:
+        _html = call_llm(_system, _user)
+        displayHTML(
+            f"""
+            <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',
+                        Roboto,sans-serif;max-width:1100px;padding:8px 16px;
+                        border:1px solid #e5e7eb;border-radius:8px;background:#fff">
+              <div style="color:#6b7280;font-size:11px;text-transform:uppercase;
+                          letter-spacing:.06em;font-weight:600;margin-bottom:4px">
+                AI executive summary · {AI_SUMMARY_MODEL}
+              </div>
+              {_html}
+            </div>
+            """
+        )
+    except Exception as e:
+        print(f"AI summary unavailable: {e}")
+
+# COMMAND ----------
+
 # Warehouse savings by category — recommended chart: BAR
 #   Keys: category    Values: savings_30d    (secondary: warehouses)
 if _nonempty(wh):

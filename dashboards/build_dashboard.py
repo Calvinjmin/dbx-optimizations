@@ -765,6 +765,80 @@ WHERE fit_score >= (SELECT min_fit_score FROM waf_config)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AI executive summary — synthesizes all three outputs into one narrative.
+# Datasets can't reference each other, so we wrap the three queries above as
+# CTEs (nested WITH inside a subquery is valid Databricks SQL), roll their
+# headline figures + top items into a single text payload, and hand that to
+# ai_query() for a one-row HTML summary. Rendered on the Overview page via an
+# allowHTML table cell. Gated by the `enable_ai_summary` parameter (INTEGER 0/1
+# — Lakeview has no BOOLEAN param type) so viewers can avoid the LLM round-trip.
+# Requires a Serverless SQL warehouse (AI Functions prerequisite).
+# ─────────────────────────────────────────────────────────────────────────────
+
+EXEC_SUMMARY_SQL = f"""WITH
+wh AS ( {WAREHOUSE_SQL} ),
+qt AS ( {QUERY_TABLE_SQL} ),
+jb AS ( {JOBS_SQL} ),
+
+agg AS (
+  SELECT
+    (SELECT COUNT(*) FROM wh)                             AS wh_count,
+    (SELECT ROUND(SUM(effective_savings_30d), 0) FROM wh) AS wh_savings,
+    (SELECT COUNT(*) FROM qt)                             AS qt_count,
+    (SELECT ROUND(SUM(compute_hours), 0) FROM qt)         AS qt_hours,
+    (SELECT COUNT(*) FROM jb)                             AS jb_count,
+    (SELECT ROUND(SUM(classic_dbu_cost_30d), 0) FROM jb)  AS jb_spend
+),
+
+payload AS (
+  SELECT CONCAT_WS('\\n',
+    CONCAT('Warehouses flagged: ', wh_count, ' | est 30d savings $', wh_savings),
+    CONCAT('Query/table optimizations: ', qt_count, ' | ', qt_hours, ' compute hours'),
+    CONCAT('Jobs->serverless candidates: ', jb_count,
+           ' | addressable classic spend $', jb_spend),
+    '--- Top warehouse actions ---',
+    (SELECT CONCAT_WS('\\n', COLLECT_LIST(line)) FROM (
+       SELECT CONCAT('- ', warehouse_name, ' [', category, '] save $',
+                     ROUND(effective_savings_30d, 0), ': ', recommended_action) AS line
+       FROM wh ORDER BY effective_savings_30d DESC LIMIT 5)),
+    '--- Top query/table actions ---',
+    (SELECT CONCAT_WS('\\n', COLLECT_LIST(line)) FROM (
+       SELECT CONCAT('- [', category, '] ', recommended_action) AS line
+       FROM qt ORDER BY total_compute_s DESC LIMIT 5)),
+    '--- Top job candidates ---',
+    (SELECT CONCAT_WS('\\n', COLLECT_LIST(line)) FROM (
+       SELECT CONCAT('- ', job_name, ' fit ', fit_score, '/100, $',
+                     ROUND(classic_dbu_cost_30d, 0), ': ',
+                     COALESCE(top_reasons, '')) AS line
+       FROM jb ORDER BY fit_score DESC, classic_dbu_cost_30d DESC LIMIT 5))
+  ) AS body
+  FROM agg
+)
+
+SELECT
+  CASE WHEN :enable_ai_summary = 1 THEN
+    ai_query(
+      'databricks-claude-sonnet-4',
+      CONCAT(
+        'You are a Databricks cost-optimization advisor. Using ONLY the signals ',
+        'below, write a brief executive summary as clean HTML (use <h3>, <p>, ',
+        '<ul>, <li>, <ol>, <strong>, <em> only; no <script>, no inline CSS). ',
+        'Start with a one-paragraph Executive Summary of the total opportunity, ',
+        'then an ordered list of 3-5 Priority Actions spanning warehouses, ',
+        'queries/tables, and jobs. Do not invent numbers; cite the figures ',
+        'provided.\\n\\n', body),
+      modelParameters => named_struct('max_tokens', 1200, 'temperature', 0.2),
+      failOnError => false
+    ).result
+  ELSE
+    '<p><em>AI summary disabled. Toggle "Enable AI summary" on the Filters page to generate it.</em></p>'
+  END AS exec_summary_html
+FROM payload
+LIMIT 1
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Dashboard parameters — declared on every dataset that uses them (all three
 # share WAF_CONFIG_CTE, so each dataset references all four). Defaults match
 # queries/config.sql; viewers can override them via the Filters page widgets.
@@ -789,6 +863,10 @@ PARAM_DECLS = [
     _param("Min query duration (s)",   "min_query_duration_s",     "INTEGER", 5),
     _param("Min job fit score",        "min_fit_score",            "INTEGER", 40),
     _param("Min job cost 30d ($)",     "min_classic_dbu_cost_30d", "DECIMAL", "25.0"),
+    # INTEGER 0/1 toggle (Lakeview has no BOOLEAN param) — gates the exec_summary
+    # ai_query() call. Declared on every dataset for uniformity; only used by
+    # exec_summary. Unused declared params are harmless.
+    _param("Enable AI summary",        "enable_ai_summary",        "INTEGER", 1),
 ]
 
 ALL_DATASETS = ["warehouse_recos", "query_table_recos", "jobs_recos"]
@@ -895,6 +973,49 @@ def table(name, title, dataset, columns, x, y, w=6, h=8):
     }
 
 
+def html_cell(name, title, dataset, field, x, y, w=6, h=8):
+    """Single-cell table widget that renders one string column as sanitized HTML.
+
+    Lakeview has no markdown/rich-text widget bound to a dataset value, and the
+    `text` widget is static. The only path to dataset-driven rich text on the
+    canvas is a table column flagged `allowHTML` with `displayAs: "string"`.
+    Pair with a dataset that returns exactly one row / one column."""
+    return {
+        "widget": {
+            "name": name,
+            "queries": [{
+                "name": "main_query",
+                "query": {
+                    "datasetName": dataset,
+                    "fields": [{"name": field, "expression": f"`{field}`"}],
+                    "disaggregated": True,
+                },
+            }],
+            "spec": {
+                "version": 2,
+                "widgetType": "table",
+                "encodings": {"columns": [{
+                    "fieldName": field,
+                    "displayName": title,
+                    "type": "string",
+                    "displayAs": "string",
+                    "allowHTML": True,
+                    "visible": True,
+                    "order": 0,
+                    "title": title,
+                    "alignContent": "left",
+                    "allowSearch": False,
+                    "highlightLinks": False,
+                    "useMonospaceFont": False,
+                    "preserveWhitespace": False,
+                }]},
+                "frame": {"showTitle": True, "title": title},
+            },
+        },
+        "position": {"x": x, "y": y, "width": w, "height": h},
+    }
+
+
 def param_widget(name, title, keyword, datasets, x, y, w=2, h=2):
     """Threshold-input widget that drives a dataset parameter across one or
     more datasets. Each dataset's parameter is bound via its own sub-query;
@@ -973,43 +1094,48 @@ overview_page = {
               "plus the criteria that flagged it. Tabs above drill into each source."],
              0, 1, 6, 1),
 
-        text("ov-section-counts", ["### Eligible items by source"], 0, 2, 6, 1),
+        # AI-synthesized executive summary across all three outputs. Backed by the
+        # exec_summary dataset's ai_query() call; toggle on the Filters page.
+        html_cell("ov-ai-summary", "AI executive summary", "exec_summary",
+                  "exec_summary_html", x=0, y=2, w=6, h=12),
+
+        text("ov-section-counts", ["### Eligible items by source"], 0, 14, 6, 1),
 
         counter_agg("ov-wh-count", "Warehouses flagged", "warehouse_recos",
-                    "count(warehouse_id)", "COUNT(`warehouse_id`)", x=0, y=3),
+                    "count(warehouse_id)", "COUNT(`warehouse_id`)", x=0, y=15),
         counter_agg("ov-qt-count", "Query / table optimizations", "query_table_recos",
-                    "count(category)", "COUNT(`category`)", x=2, y=3),
+                    "count(category)", "COUNT(`category`)", x=2, y=15),
         counter_agg("ov-jb-count", "Jobs -> serverless", "jobs_recos",
-                    "count(job_id)", "COUNT(`job_id`)", x=4, y=3),
+                    "count(job_id)", "COUNT(`job_id`)", x=4, y=15),
 
-        text("ov-section-money", ["### 30-day cost opportunity"], 0, 6, 6, 1),
+        text("ov-section-money", ["### 30-day cost opportunity"], 0, 18, 6, 1),
 
         counter_agg("ov-wh-savings", "Warehouse savings (30d)", "warehouse_recos",
-                    "sum(effective_savings_30d)", "SUM(`effective_savings_30d`)", x=0, y=7),
+                    "sum(effective_savings_30d)", "SUM(`effective_savings_30d`)", x=0, y=19),
         counter_agg("ov-jb-spend", "Addressable classic-job spend (30d)", "jobs_recos",
-                    "sum(classic_dbu_cost_30d)", "SUM(`classic_dbu_cost_30d`)", x=2, y=7),
+                    "sum(classic_dbu_cost_30d)", "SUM(`classic_dbu_cost_30d`)", x=2, y=19),
         counter_agg("ov-qt-hours", "Compute hours flagged", "query_table_recos",
-                    "sum(compute_hours)", "SUM(`compute_hours`)", x=4, y=7),
+                    "sum(compute_hours)", "SUM(`compute_hours`)", x=4, y=19),
 
-        text("ov-section-breakdown", ["### Eligibility breakdown by reason"], 0, 10, 6, 1),
+        text("ov-section-breakdown", ["### Eligibility breakdown by reason"], 0, 22, 6, 1),
 
         bar_grouped("ov-wh-by-cat", "Warehouse recommendations by category",
                     "warehouse_recos", "category",
                     "count(warehouse_id)", "COUNT(`warehouse_id`)",
-                    x=0, y=11, w=3, h=6, dim_display="Category", val_display="# warehouses"),
+                    x=0, y=23, w=3, h=6, dim_display="Category", val_display="# warehouses"),
         bar_grouped("ov-qt-by-cat", "Query/table candidates by category",
                     "query_table_recos", "category",
                     "count(category)", "COUNT(`category`)",
-                    x=3, y=11, w=3, h=6, dim_display="Category", val_display="# candidates"),
+                    x=3, y=23, w=3, h=6, dim_display="Category", val_display="# candidates"),
 
         bar_grouped("ov-jb-by-bucket", "Jobs by serverless fit bucket",
                     "jobs_recos", "fit_bucket",
                     "count(job_id)", "COUNT(`job_id`)",
-                    x=0, y=17, w=3, h=6, dim_display="Fit bucket", val_display="# jobs"),
+                    x=0, y=29, w=3, h=6, dim_display="Fit bucket", val_display="# jobs"),
         bar_grouped("ov-jb-spend-bucket", "Addressable classic spend by fit bucket",
                     "jobs_recos", "fit_bucket",
                     "sum(classic_dbu_cost_30d)", "SUM(`classic_dbu_cost_30d`)",
-                    x=3, y=17, w=3, h=6, dim_display="Fit bucket", val_display="$ classic 30d"),
+                    x=3, y=29, w=3, h=6, dim_display="Fit bucket", val_display="$ classic 30d"),
     ],
 }
 
@@ -1196,6 +1322,11 @@ filters_page = {
                       x=0, y=4, w=3),
         column_filter("f-jb-risk",   "Job migration risk", "jobs_recos",        "migration_risk",
                       x=3, y=4, w=3),
+
+        # Row 6: AI executive-summary cost toggle. 1 = call ai_query on refresh,
+        # 0 = show a static "disabled" message (no LLM round-trip / cost).
+        param_widget("p-enable-ai", "Enable AI summary", "enable_ai_summary",
+                     ["exec_summary"], x=0, y=6),
     ],
 }
 
@@ -1204,6 +1335,12 @@ def build_dashboard_dict() -> dict:
     """Return the dashboard as a Python dict, ready to serialize for the API."""
     return {
         "datasets": [
+            {
+                "name": "exec_summary",
+                "displayName": "AI executive summary",
+                "queryLines": [EXEC_SUMMARY_SQL],
+                "parameters": PARAM_DECLS,
+            },
             {
                 "name": "warehouse_recos",
                 "displayName": "Warehouse recommendations",

@@ -44,6 +44,21 @@ resources:
       file_path: ./dashboards/waf_recommendations.lvdash.json
       warehouse_id: ${var.sql_warehouse_id}
 
+  jobs:
+    # On-demand job that regenerates the AI executive summary and patches it into
+    # the live dashboard. Triggered from the dashboard's "Refresh AI summary"
+    # link (set WAF_REFRESH_JOB_URL to this job's Run page when building the
+    # dashboard) or run manually. Serverless compute (ai_query requires it).
+    refresh_exec_summary:
+      name: WAF refresh exec summary
+      tasks:
+        - task_key: refresh
+          notebook_task:
+            notebook_path: ./notebooks/refresh_summary.py
+            base_parameters:
+              dashboard_id: ${resources.dashboards.waf_recommendations.id}
+              warehouse_id: ${var.sql_warehouse_id}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Targets — one per environment. `dev` is the default; deploy to prod with
 # `databricks bundle deploy --target prod`. Override per-target by setting

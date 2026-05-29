@@ -28,6 +28,11 @@ dbutils.widgets.multiselect(
     label="Queries to run",
 )
 
+# Executive filters — mirror the dashboard's Min savings / Min confidence inputs.
+# Applied to the result frames in §3 (and so to the KPIs, tables, and AI summary).
+dbutils.widgets.text("min_savings_30d", "0", label="Min savings 30d ($)")
+dbutils.widgets.text("min_confidence", "0", label="Min confidence (0-100)")
+
 # COMMAND ----------
 
 _nb_path = (
@@ -241,6 +246,49 @@ if _nonempty(wh):
         axis=1,
     )
 
+
+# Deterministic confidence (0-100) + executive filters — mirror the dashboard's
+# confidence/savings wrappers in dashboards/build_dashboard.py so the notebook and
+# dashboard agree. Min savings applies to warehouses + jobs ($ figures);
+# query/table rows have no direct $ so only the confidence floor applies.
+MIN_SAVINGS_30D = float(dbutils.widgets.get("min_savings_30d") or 0)
+MIN_CONFIDENCE = float(dbutils.widgets.get("min_confidence") or 0)
+
+
+def _clip(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+if _nonempty(wh):
+    wh["confidence"] = wh.apply(
+        lambda r: 95
+        if r["category"] == "DECOMMISSION_CANDIDATE"
+        else int(round(_clip(
+            50
+            + min(30.0, float(r.get("query_count") or 0) / 10.0)
+            + min(20.0, abs(float(r.get("cost_delta_pct") or 0)) / 2.0), 0, 100))),
+        axis=1,
+    )
+    wh = wh[(wh["confidence"] >= MIN_CONFIDENCE)
+            & (wh["effective_savings_30d"].fillna(0) >= MIN_SAVINGS_30D)]
+
+if _nonempty(qt):
+    qt = qt.copy()
+    qt["confidence"] = qt.apply(
+        lambda r: int(round(_clip(
+            40
+            + min(40.0, float(r.get("exec_count") or 0) / 5.0)
+            + min(20.0, float(r.get("total_compute_s") or 0) / 600.0), 0, 100))),
+        axis=1,
+    )
+    qt = qt[qt["confidence"] >= MIN_CONFIDENCE]
+
+if _nonempty(jb):
+    jb = jb.copy()
+    jb["confidence"] = jb["fit_score"].fillna(0).astype(int)
+    jb = jb[(jb["confidence"] >= MIN_CONFIDENCE)
+            & (jb["classic_dbu_cost_30d"].fillna(0) >= MIN_SAVINGS_30D)]
+
 wh_savings_30d = float(wh["effective_savings_30d"].sum()) if _nonempty(wh) else 0.0
 wh_current_spend_30d = (
     float(wh["current_cost_30d"].fillna(0).sum()) if _nonempty(wh) else 0.0
@@ -378,9 +426,12 @@ else:
         "You are a Databricks cost/performance optimization advisor. Using ONLY "
         "the data provided, produce a one-paragraph Executive Summary of the total "
         "opportunity, then a numbered list of 3-5 Priority Actions spanning "
-        "warehouses, queries/tables, and jobs. Respond in clean HTML using only "
-        "<h3>, <p>, <ol>, <li>, <strong>, <em> tags (no <script>, no inline CSS). "
-        "Do not invent numbers; cite the figures given."
+        "warehouses, queries/tables, and jobs, ordered by impact. Each action ends "
+        "with a confidence label derived from the per-row `confidence` column "
+        "(>=80 High, 60-79 Medium, else Low), e.g. <em>(Confidence: High)</em>. "
+        "Respond in clean HTML using only <h3>, <p>, <ol>, <li>, <strong>, <em> "
+        "tags (no <script>, no inline CSS). Do not invent numbers; cite the "
+        "figures given. This matches the dashboard's executive summary."
     )
     _kpis = (
         f"- Identified warehouse savings (30d): ${wh_savings_30d:,.0f}\n"
